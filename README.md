@@ -1,4 +1,4 @@
-![Affine Gaps Thumbnail](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/affine-gaps.jpg?raw=true)
+![Affine Gaps Thumbnail](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/AffineGaps.jpg?raw=true)
 
 __Affine Gaps__ is a __less-wrong__ single-file Numba-accelerated Python implementation of Osamu Gotoh affine gap penalty extensions 1982 [paper](https://doc.aporc.org/attach/Course001Papers/gotoh1982.pdf) for the Needleman-Wunsch and Smith-Waterman algorithms often used for global and local sequence alignment in Bioinformatics.
 Thanks to the Numba JIT compiler, it's also competitive in terms of performance.
