@@ -1,3 +1,5 @@
+# AffineGaps
+
 ![Affine Gaps Thumbnail](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/AffineGaps.jpg?raw=true)
 
 __Affine Gaps__ is a __less-wrong__ single-file Numba-accelerated Python implementation of Osamu Gotoh affine gap penalty extensions 1982 [paper](https://doc.aporc.org/attach/Course001Papers/gotoh1982.pdf) for the Needleman-Wunsch and Smith-Waterman algorithms often used for global and local sequence alignment in Bioinformatics.
@@ -34,15 +36,15 @@ Numba is optional.
 Installing without it gives a pure-Python baseline; installing with the `numba` extra enables JIT acceleration when a compatible Numba is available.
 
 ```sh
-uv pip install affine-gaps          # minimal
-uv pip install 'affine-gaps[numba]' # with JIT
+uv pip install affinegaps          # minimal
+uv pip install 'affinegaps[numba]' # with JIT
 ```
 
 Even without installing Python or touching PyPi, you can just use `uv` to get the latest version of the library:
 
 ```bash
-$ uv tool install git+https://github.com/ashvardanian/affine-gaps.git
-$ affine-gaps --help
+$ uv tool install git+https://github.com/unum-bio/AffineGaps.git
+$ affinegaps --help
 ```
 
 ## Using the Library
@@ -50,7 +52,7 @@ $ affine-gaps --help
 To obtain the alignment of two sequences, use the `needleman_wunsch_gotoh_alignment` function.
 
 ```python
-from affine_gaps import needleman_wunsch_gotoh_alignment
+from affinegaps import needleman_wunsch_gotoh_alignment
 
 insulin = "GIVEQCCTSICSLYQLENYCN"
 glucagon = "HSQGTFTSDYSKYLDSRAEQDFV"
@@ -64,7 +66,7 @@ print("Score:", aligned_score)          # 41
 If you only need the alignment score, you can use the `needleman_wunsch_gotoh_score` function, which uses less memory and works faster.
 
 ```python
-from affine_gaps import needleman_wunsch_gotoh_score
+from affinegaps import needleman_wunsch_gotoh_score
 
 score = needleman_wunsch_gotoh_score(insulin, glucagon)
 
@@ -108,7 +110,7 @@ aligner.extend_gap_score = extend_gap_score
 To compute the optimal global alignment of insulin and glucagon sequences with (5x-scaled) BLOSUM62 substitution matrix through CLI:
 
 ```bash
-$ affine-gaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV
+$ affinegaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV
 >
 > Sequence 1: GIVEQCCTSICSLYQLENYCN
 > Sequence 2: HSQGTFTSDYSKYLDSRAEQDFV
@@ -122,7 +124,7 @@ To compute the local alignment of insulin and glucagon sequences through CLI:
 
 ```bash
 
-$ affine-gaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV --local
+$ affinegaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV --local
 > 
 > Sequence 1: GIVEQCCTSICSLYQLENYCN
 > Sequence 2: HSQGTFTSDYSKYLDSRAEQDFV

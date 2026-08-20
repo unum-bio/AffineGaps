@@ -1,28 +1,35 @@
 [build-system]
-requires = ["hatchling"]
 build-backend = "hatchling.build"
+requires = ["hatchling"]
 
 [project]
-name = "affine-gaps"
-version = "0.2.4"
-description = "JIT-compiled string edit-distances including Needleman-Wunsch, Smith-Waterman, Wagner-Fisher, and Gotoh algorithms."
-readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
-    { name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com" },
+  {name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com"},
 ]
-requires-python = ">=3.6"
-dependencies = ["numpy"]
-keywords = ["bioinformatics", "sequence alignment", "numba", "affine gaps"]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: Apache Software License",
-    "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
 ]
+dependencies = ["numpy"]
+description = "JIT-compiled string edit-distances including Needleman-Wunsch, Smith-Waterman, Wagner-Fisher, and Gotoh algorithms."
+keywords = ["bioinformatics", "sequence alignment", "numba", "affine gaps"]
+name = "affinegaps"
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.12"
+version = "0.2.4"
 
 [project.optional-dependencies]
-jit = ["numba", "colorama"]
 dev = ["biopython", "stringzilla", "pytest", "pytest-repeat"]
+jit = ["numba", "colorama"]
 numba = ["numba"]
+
+# A group rather than an extra, so the checkers stay out of the published wheel's metadata.
+[dependency-groups]
+lint = ["ruff>=0.15", "black>=26", "mypy>=2", "numpy"]
 
 [tool.pytest.ini_options]
 addopts = "-s -x"
@@ -30,8 +37,20 @@ addopts = "-s -x"
 # Configuration options for the Black formatter:
 # https://black.readthedocs.io/en/latest/usage_and_configuration/the_basics.html#where-black-looks-for-the-file
 [tool.black]
-line-length = 120                  # Set line length to the same value as in `.clang-format` for modern wide screens
-target-version = ['py36', 'py312']
+line-length = 120 # Set line length to the same value as in `.clang-format` for modern wide screens
+target-version = ['py312'] 
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+files = ["affinegaps.py"] 
+ignore_missing_imports = true # NumBa and colorama are optional at runtime
+python_version = "3.12" 
 
 [project.scripts]
-affine-gaps = "affine_gaps:main"
+affinegaps = "affinegaps:main"

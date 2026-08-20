@@ -3,8 +3,8 @@
 Affine Gaps Alignment Toolkit
 
 This single-file library and CLI tool provides robust implementations of sequence alignment algorithms,
-including Needleman-Wunsch, Smith-Waterman, and Levenshtein, with support for affine gap penalties. 
-The toolkit is designed for both programmatic use and command-line operation, making it versatile 
+including Needleman-Wunsch, Smith-Waterman, and Levenshtein, with support for affine gap penalties.
+The toolkit is designed for both programmatic use and command-line operation, making it versatile
 for bio-informatics, computational biology, and general sequence alignment tasks.
 
 Key Features:
@@ -18,7 +18,7 @@ Key Features:
 Usage:
 1. Library:
     Import and use the library functions for programmatic sequence alignment:
-    >>> from affine_gaps import needleman_wunsch_gotoh_alignment
+    >>> from affinegaps import needleman_wunsch_gotoh_alignment
     >>> align1, align2, score = needleman_wunsch_gotoh_alignment("GATTACA", "GCATGCU")
     >>> print("Alignment 1:", align1)
     >>> print("Alignment 2:", align2)
@@ -26,7 +26,7 @@ Usage:
 
 2. CLI:
     Use the tool directly from the command line for quick alignment tasks:
-    $ python affine_gaps.py GATTACA GCATGCU --local
+    $ affinegaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV --local
     Sequence 1: GATTACA
     Sequence 2: GCATGCU
 
@@ -35,17 +35,17 @@ Usage:
     Score:       3
 
 Dependencies:
-- Python 3.6+
+- Python 3.12+
 - NumPy (required)
 - NumBa (optional, for acceleration)
 - colorama (optional, for colored CLI output)
 
 Author: Ash Vardanian
-Version: 1.0.1
 License: Apache 2.0
 """
 
-from typing import Tuple, Optional, Callable, Literal
+from typing import Literal
+from collections.abc import Callable
 
 import numpy as np
 
@@ -58,6 +58,7 @@ except ImportError:
     HAS_NUMBA = False
 
 __version__ = "0.2.4"
+
 
 # Define decorator to handle optional NumBa
 def jit_if_available(*jit_args, **jit_kwargs):
@@ -74,40 +75,40 @@ MATCH, INSERT, DELETE, SUBSTITUTE = 0, 1, 2, 3
 
 # By default, we use BLOSUM62 with affine gap penalties
 default_proteins_alphabet: str = "ARNDCQEGHILKMFPSTWYVBZX"
+# fmt: off
 default_proteins_matrix = (
     np.array(
         [
-            # fmt: off
-            4, -1, -2, -2,  0, -1, -1,  0, -2, -1, -1, -1, -1, -2, -1,  1,  0, -3, -2,  0, -2, -1,  0, -4, 
-            -1,  5,  0, -2, -3,  1,  0, -2,  0, -3, -2,  2, -1, -3, -2, -1, -1, -3, -2, -3, -1,  0, -1, -4, 
-            -2,  0,  6,  1, -3,  0,  0,  0,  1, -3, -3,  0, -2, -3, -2,  1,  0, -4, -2, -3,  3,  0, -1, -4, 
-            -2, -2,  1,  6, -3,  0,  2, -1, -1, -3, -4, -1, -3, -3, -1,  0, -1, -4, -3, -3,  4,  1, -1, -4, 
-            0, -3, -3, -3,  9, -3, -4, -3, -3, -1, -1, -3, -1, -2, -3, -1, -1, -2, -2, -1, -3, -3, -2, -4, 
-            -1,  1,  0,  0, -3,  5,  2, -2,  0, -3, -2,  1,  0, -3, -1,  0, -1, -2, -1, -2,  0,  3, -1, -4, 
-            -1,  0,  0,  2, -4,  2,  5, -2,  0, -3, -3,  1, -2, -3, -1,  0, -1, -3, -2, -2,  1,  4, -1, -4, 
-            0, -2,  0, -1, -3, -2, -2,  6, -2, -4, -4, -2, -3, -3, -2,  0, -2, -2, -3, -3, -1, -2, -1, -4, 
-            -2,  0,  1, -1, -3,  0,  0, -2,  8, -3, -3, -1, -2, -1, -2, -1, -2, -2,  2, -3,  0,  0, -1, -4, 
-            -1, -3, -3, -3, -1, -3, -3, -4, -3,  4,  2, -3,  1,  0, -3, -2, -1, -3, -1,  3, -3, -3, -1, -4, 
-            -1, -2, -3, -4, -1, -2, -3, -4, -3,  2,  4, -2,  2,  0, -3, -2, -1, -2, -1,  1, -4, -3, -1, -4, 
-            -1,  2,  0, -1, -3,  1,  1, -2, -1, -3, -2,  5, -1, -3, -1,  0, -1, -3, -2, -2,  0,  1, -1, -4, 
-            -1, -1, -2, -3, -1,  0, -2, -3, -2,  1,  2, -1,  5,  0, -2, -1, -1, -1, -1,  1, -3, -1, -1, -4, 
-            -2, -3, -3, -3, -2, -3, -3, -3, -1,  0,  0, -3,  0,  6, -4, -2, -2,  1,  3, -1, -3, -3, -1, -4, 
-            -1, -2, -2, -1, -3, -1, -1, -2, -2, -3, -3, -1, -2, -4,  7, -1, -1, -4, -3, -2, -2, -1, -2, -4, 
-            1, -1,  1,  0, -1,  0,  0,  0, -1, -2, -2,  0, -1, -2, -1,  4,  1, -3, -2, -2,  0,  0,  0, -4, 
-            0, -1,  0, -1, -1, -1, -1, -2, -2, -1, -1, -1, -1, -2, -1,  1,  5, -2, -2,  0, -1, -1,  0, -4, 
-            -3, -3, -4, -4, -2, -2, -3, -2, -2, -3, -2, -3, -1,  1, -4, -3, -2, 11,  2, -3, -4, -3, -2, -4, 
-            -2, -2, -2, -3, -2, -1, -2, -3,  2, -1, -1, -2, -1,  3, -3, -2, -2,  2,  7, -1, -3, -2, -1, -4, 
-            0, -3, -3, -3, -1, -2, -2, -3, -3,  3,  1, -2,  1, -1, -2, -2,  0, -3, -1,  4, -3, -2, -1, -4, 
-            -2, -1,  3,  4, -3,  0,  1, -1,  0, -3, -4,  0, -3, -3, -2,  0, -1, -4, -3, -3,  4,  1, -1, -4, 
-            -1,  0,  0,  1, -3,  3,  4, -2,  0, -3, -3,  1, -1, -3, -1,  0, -1, -3, -2, -2,  1,  4, -1, -4, 
-            0, -1, -1, -1, -2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -2,  0,  0, -2, -1, -1, -1, -1, -1, -4, 
+            4, -1, -2, -2,  0, -1, -1,  0, -2, -1, -1, -1, -1, -2, -1,  1,  0, -3, -2,  0, -2, -1,  0, -4,
+            -1,  5,  0, -2, -3,  1,  0, -2,  0, -3, -2,  2, -1, -3, -2, -1, -1, -3, -2, -3, -1,  0, -1, -4,
+            -2,  0,  6,  1, -3,  0,  0,  0,  1, -3, -3,  0, -2, -3, -2,  1,  0, -4, -2, -3,  3,  0, -1, -4,
+            -2, -2,  1,  6, -3,  0,  2, -1, -1, -3, -4, -1, -3, -3, -1,  0, -1, -4, -3, -3,  4,  1, -1, -4,
+            0, -3, -3, -3,  9, -3, -4, -3, -3, -1, -1, -3, -1, -2, -3, -1, -1, -2, -2, -1, -3, -3, -2, -4,
+            -1,  1,  0,  0, -3,  5,  2, -2,  0, -3, -2,  1,  0, -3, -1,  0, -1, -2, -1, -2,  0,  3, -1, -4,
+            -1,  0,  0,  2, -4,  2,  5, -2,  0, -3, -3,  1, -2, -3, -1,  0, -1, -3, -2, -2,  1,  4, -1, -4,
+            0, -2,  0, -1, -3, -2, -2,  6, -2, -4, -4, -2, -3, -3, -2,  0, -2, -2, -3, -3, -1, -2, -1, -4,
+            -2,  0,  1, -1, -3,  0,  0, -2,  8, -3, -3, -1, -2, -1, -2, -1, -2, -2,  2, -3,  0,  0, -1, -4,
+            -1, -3, -3, -3, -1, -3, -3, -4, -3,  4,  2, -3,  1,  0, -3, -2, -1, -3, -1,  3, -3, -3, -1, -4,
+            -1, -2, -3, -4, -1, -2, -3, -4, -3,  2,  4, -2,  2,  0, -3, -2, -1, -2, -1,  1, -4, -3, -1, -4,
+            -1,  2,  0, -1, -3,  1,  1, -2, -1, -3, -2,  5, -1, -3, -1,  0, -1, -3, -2, -2,  0,  1, -1, -4,
+            -1, -1, -2, -3, -1,  0, -2, -3, -2,  1,  2, -1,  5,  0, -2, -1, -1, -1, -1,  1, -3, -1, -1, -4,
+            -2, -3, -3, -3, -2, -3, -3, -3, -1,  0,  0, -3,  0,  6, -4, -2, -2,  1,  3, -1, -3, -3, -1, -4,
+            -1, -2, -2, -1, -3, -1, -1, -2, -2, -3, -3, -1, -2, -4,  7, -1, -1, -4, -3, -2, -2, -1, -2, -4,
+            1, -1,  1,  0, -1,  0,  0,  0, -1, -2, -2,  0, -1, -2, -1,  4,  1, -3, -2, -2,  0,  0,  0, -4,
+            0, -1,  0, -1, -1, -1, -1, -2, -2, -1, -1, -1, -1, -2, -1,  1,  5, -2, -2,  0, -1, -1,  0, -4,
+            -3, -3, -4, -4, -2, -2, -3, -2, -2, -3, -2, -3, -1,  1, -4, -3, -2, 11,  2, -3, -4, -3, -2, -4,
+            -2, -2, -2, -3, -2, -1, -2, -3,  2, -1, -1, -2, -1,  3, -3, -2, -2,  2,  7, -1, -3, -2, -1, -4,
+            0, -3, -3, -3, -1, -2, -2, -3, -3,  3,  1, -2,  1, -1, -2, -2,  0, -3, -1,  4, -3, -2, -1, -4,
+            -2, -1,  3,  4, -3,  0,  1, -1,  0, -3, -4,  0, -3, -3, -2,  0, -1, -4, -3, -3,  4,  1, -1, -4,
+            -1,  0,  0,  1, -3,  3,  4, -2,  0, -3, -3,  1, -1, -3, -1,  0, -1, -3, -2, -2,  1,  4, -1, -4,
+            0, -1, -1, -1, -2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -2,  0,  0, -2, -1, -1, -1, -1, -1, -4,
             -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4,  1,
-            # fmt: on
         ],
         dtype=np.int8,
     ).reshape(24, 24)
     * 5
 )
+# fmt: on
 default_gap_opening: int = -4 * 5
 default_gap_extension: int = int(-0.2 * 5)
 
@@ -118,7 +119,7 @@ def _reconstruct_alignment(
     seq2: np.ndarray,
     code_to_char: Callable,
     should_continue: Callable,
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
 
     align1, align2 = "", ""
     i, j = len(seq1), len(seq2)
@@ -163,13 +164,13 @@ def _translate_sequence(seq: str, alphabet: str) -> np.ndarray:
 
 
 def _validate_gotoh_arguments(
-    substitution_alphabet: Optional[str] = None,
-    substitution_matrix: Optional[np.ndarray] = None,
-    gap_opening: Optional[int] = None,
-    gap_extension: Optional[int] = None,
-    match: Optional[int] = None,
-    mismatch: Optional[int] = None,
-) -> Tuple[str, np.ndarray, int, int]:
+    substitution_alphabet: str | None = None,
+    substitution_matrix: np.ndarray | None = None,
+    gap_opening: int | None = None,
+    gap_extension: int | None = None,
+    match: int | None = None,
+    mismatch: int | None = None,
+) -> tuple[str, np.ndarray, int, int]:
     """Internal method that validates the arguments for the Needleman-Wunsch algorithm."""
     if (match is not None) != (mismatch is not None):
         raise ValueError("Both match and mismatch must be provided.")
@@ -194,7 +195,7 @@ def _validate_gotoh_arguments(
 
 
 @jit_if_available(nopython=True)
-def _levenshtein_alignment_kernel(seq1: np.ndarray, seq2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _levenshtein_alignment_kernel(seq1: np.ndarray, seq2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Aligns two sequences using Levenshtein's algorithm.
     The returned distance is the minimum number of single-character edits,
@@ -253,7 +254,7 @@ def _levenshtein_alignment_kernel(seq1: np.ndarray, seq2: np.ndarray) -> Tuple[n
     return scores, changes
 
 
-def levenshtein_alignment(str1: str, str2: str) -> Tuple[str, str, int]:
+def levenshtein_alignment(str1: str, str2: str) -> tuple[str, str, int]:
     """
     Aligns two sequences using Levenshtein's algorithm.
     The returned distance is the minimum number of single-character edits,
@@ -281,7 +282,7 @@ def _needleman_wunsch_gotoh_kernel(
     substitution_matrix: np.ndarray,
     gap_opening: int,
     gap_extension: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Aligns two sequences using Gotoh's affine gap penalty extensions for the
     Needleman-Wunsch global alignment algorithm.
@@ -397,13 +398,13 @@ def _needleman_wunsch_gotoh_kernel(
 def needleman_wunsch_gotoh_alignment(
     str1: str,
     str2: str,
-    substitution_alphabet: Optional[str] = None,
-    substitution_matrix: Optional[np.ndarray] = None,
-    gap_opening: Optional[int] = None,
-    gap_extension: Optional[int] = None,
-    match: Optional[int] = None,
-    mismatch: Optional[int] = None,
-) -> Tuple[str, str, int]:
+    substitution_alphabet: str | None = None,
+    substitution_matrix: np.ndarray | None = None,
+    gap_opening: int | None = None,
+    gap_extension: int | None = None,
+    match: int | None = None,
+    mismatch: int | None = None,
+) -> tuple[str, str, int]:
     """
     Aligns two sequences using Gotoh's affine gap penalty extensions for the
     Needleman-Wunsch global alignment algorithm.
@@ -428,7 +429,7 @@ def needleman_wunsch_gotoh_alignment(
     >>> gap_extension = -1
 
     Example usage:
-    >>> from affine_gaps import needleman_wunsch_gotoh_alignment
+    >>> from affinegaps import needleman_wunsch_gotoh_alignment
     >>> str1 = "GATTACA"
     >>> str2 = "GCATGCU"
     >>> align1, align2, score = needleman_wunsch_gotoh_alignment(str1, str2)
@@ -538,12 +539,12 @@ def needleman_wunsch_gotoh_score_kernel(
 def needleman_wunsch_gotoh_score(
     str1: str,
     str2: str,
-    substitution_alphabet: Optional[str] = None,
-    substitution_matrix: Optional[np.ndarray] = None,
-    gap_opening: Optional[int] = None,
-    gap_extension: Optional[int] = None,
-    match: Optional[int] = None,
-    mismatch: Optional[int] = None,
+    substitution_alphabet: str | None = None,
+    substitution_matrix: np.ndarray | None = None,
+    gap_opening: int | None = None,
+    gap_extension: int | None = None,
+    match: int | None = None,
+    mismatch: int | None = None,
 ) -> int:
     """
     Measures the alignment score of two sequences using Gotoh's affine gap penalty extensions for the
@@ -569,7 +570,7 @@ def needleman_wunsch_gotoh_score(
     >>> gap_extension = -1
 
     Example usage:
-    >>> from affine_gaps import needleman_wunsch_gotoh_score
+    >>> from affinegaps import needleman_wunsch_gotoh_score
     >>> str1 = "GATTACA"
     >>> str2 = "GCATGCU"
     >>> score = needleman_wunsch_gotoh_score(str1, str2)
@@ -615,7 +616,7 @@ def _smith_waterman_gotoh_kernel(
     substitution_matrix: np.ndarray,
     gap_opening: int,
     gap_extension: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
     """
     Aligns two sequences using Gotoh's affine gap penalty extensions for the
     Smith-Waterman local alignment algorithm.
@@ -645,7 +646,7 @@ def _smith_waterman_gotoh_kernel(
     >>> substitution_matrix = np.array([[...], [...], [...]])  # Example substitution matrix
     >>> gap_opening = 5
     >>> gap_extension = 2
-    >>> scores, changes = _smith_waterman_gotoh_kernel(seq1, seq2, substitution_matrix, gap_opening, gap_extension)
+    >>> scores, changes, max_pos = _smith_waterman_gotoh_kernel(seq1, seq2, matrix, gap_opening, gap_extension)
     >>> print("Optimal alignment score matrix:\n", scores)
 
     Notes:
@@ -738,13 +739,13 @@ def _smith_waterman_gotoh_kernel(
 def smith_waterman_gotoh_alignment(
     str1: str,
     str2: str,
-    substitution_alphabet: Optional[str] = None,
-    substitution_matrix: Optional[np.ndarray] = None,
-    gap_opening: Optional[int] = None,
-    gap_extension: Optional[int] = None,
-    match: Optional[int] = None,
-    mismatch: Optional[int] = None,
-) -> Tuple[str, str, int]:
+    substitution_alphabet: str | None = None,
+    substitution_matrix: np.ndarray | None = None,
+    gap_opening: int | None = None,
+    gap_extension: int | None = None,
+    match: int | None = None,
+    mismatch: int | None = None,
+) -> tuple[str, str, int]:
     """
     Aligns two sequences using the Smith-Waterman algorithm for local alignment.
 
@@ -862,12 +863,12 @@ def smith_waterman_gotoh_score_kernel(
 def smith_waterman_gotoh_score(
     str1: str,
     str2: str,
-    substitution_alphabet: Optional[str] = None,
-    substitution_matrix: Optional[np.ndarray] = None,
-    gap_opening: Optional[int] = None,
-    gap_extension: Optional[int] = None,
-    match: Optional[int] = None,
-    mismatch: Optional[int] = None,
+    substitution_alphabet: str | None = None,
+    substitution_matrix: np.ndarray | None = None,
+    gap_opening: int | None = None,
+    gap_extension: int | None = None,
+    match: int | None = None,
+    mismatch: int | None = None,
 ) -> int:
     """
     Measures the Smith-Waterman local alignment score using Gotoh's affine gap penalty extensions.
@@ -886,7 +887,7 @@ def smith_waterman_gotoh_score(
     int: The highest alignment score.
 
     Example usage:
-    >>> from affine_gaps import smith_waterman_gotoh_score
+    >>> from affinegaps import smith_waterman_gotoh_score
     >>> str1 = "GATTACA"
     >>> str2 = "GCATGCU"
     >>> score = smith_waterman_gotoh_score(str1, str2)
@@ -916,7 +917,7 @@ def smith_waterman_gotoh_score(
     return int(score)
 
 
-def colorize_alignment(align1: str, align2: str, background: Literal["dark", "light"] = "dark") -> Tuple[str, str]:
+def colorize_alignment(align1: str, align2: str, background: Literal["dark", "light"] = "dark") -> tuple[str, str]:
     """
     Colorizes the alignment strings for visual distinction between matches, mismatches, and gaps.
     Adjusts colors based on the specified background color.
@@ -947,7 +948,7 @@ def colorize_alignment(align1: str, align2: str, background: Literal["dark", "li
     colored_align1 = ""
     colored_align2 = ""
 
-    for a, b in zip(align1, align2):
+    for a, b in zip(align1, align2, strict=True):
         if a == b and a != "-":
             colored_align1 += match_color + a + Style.RESET_ALL
             colored_align2 += match_color + b + Style.RESET_ALL

@@ -1,0 +1,93 @@
+name: Pre-Release
+
+on:
+  push:
+    branches: ["main-dev"]
+    paths-ignore: ["**/*.md", "LICENSE", ".gitignore", "assets/**"]
+  pull_request:
+    branches: ["main", "main-dev"]
+    paths-ignore: ["**/*.md", "LICENSE", ".gitignore", "assets/**"]
+
+env:
+  GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+  PYTHONUTF8: 1
+  PYTHONFAULTHANDLER: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  versioning:
+    name: Update Version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run TinySemVer
+        uses: ashvardanian/tinysemver@v3
+        with:
+          verbose: "true"
+          version-file: "VERSION"
+          update-version-in: |
+            pyproject.toml:^version = "(\d+\.\d+\.\d+)"
+            setup.py:    version="(\d+\.\d+\.\d+)"
+            affinegaps.py:^__version__ = "(\d+\.\d+\.\d+)"
+          dry-run: "true"
+
+  # Gates the matrix below. A formatting or typing break is the same on every interpreter, so
+  # finding it once on the oldest supported one beats finding it three times in parallel.
+  lint:
+    name: Static Analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install Checkers
+        run: |
+          python -m pip install --upgrade pip
+          pip install --group lint
+      - name: Format
+        run: black --check --diff affinegaps.py test.py
+      - name: Lint
+        run: ruff check affinegaps.py test.py
+      - name: Types
+        run: mypy
+
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,jit]"
+      - name: Test
+        run: pytest test.py -x -q

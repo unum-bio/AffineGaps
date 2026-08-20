@@ -2,7 +2,7 @@
 """
 Test suite for affine gap alignment functions.
 
-This suite validates the correctness and consistency of several alignment functions, 
+This suite validates the correctness and consistency of several alignment functions,
 including Needleman-Wunsch, Smith-Waterman, and Levenshtein alignments. Tests ensure:
 
 - Symmetry of alignment scores.
@@ -10,19 +10,20 @@ including Needleman-Wunsch, Smith-Waterman, and Levenshtein alignments. Tests en
 - Proper handling of gap expansions and penalty configurations.
 - Verification of alignment results against known examples and random inputs.
 """
+
 import os
 import re
 import math
 import tempfile
 import subprocess
 from random import choice, randint, getrandbits
-from typing import Tuple, Literal
+from typing import Literal
 
 import pytest
 from Bio import Align
 from Bio.Align import substitution_matrices
 
-from affine_gaps import (
+from affinegaps import (
     needleman_wunsch_gotoh_alignment,
     needleman_wunsch_gotoh_score,
     smith_waterman_gotoh_alignment,
@@ -91,13 +92,12 @@ T  {mismatch}  {mismatch}  {mismatch}  {match}
     """
 
     # Create temporary files for sequences and matrix
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".fa") as tmp1, tempfile.NamedTemporaryFile(
-        mode="w", delete=False, suffix=".fa"
-    ) as tmp2, tempfile.NamedTemporaryFile(
-        mode="w", delete=False, suffix=".mat"
-    ) as tmp_matrix, tempfile.NamedTemporaryFile(
-        mode="w", delete=False, suffix=".txt"
-    ) as tmp_output:
+    with (
+        tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".fa") as tmp1,
+        tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".fa") as tmp2,
+        tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".mat") as tmp_matrix,
+        tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as tmp_output,
+    ):
 
         tmp1.write(f">seq1\n{seq1}\n")
         tmp2.write(f">seq2\n{seq2}\n")
@@ -137,7 +137,7 @@ T  {mismatch}  {mismatch}  {mismatch}  {match}
             raise Exception(f"Needle failed with return code {result.returncode} and error message: {result.stderr}")
 
         # Read the output file
-        with open(output_name, "r") as file:
+        with open(output_name) as file:
             output_content = file.read()
 
         # Extract relevant information using regex
@@ -147,7 +147,7 @@ T  {mismatch}  {mismatch}  {mismatch}  {match}
         assert score_match, f"Score not found in {output_content}"
         assert alignment_match, f"Alignments not found in {output_content}"
 
-        score = int(math.floor(float(score_match.group(1))))
+        score = math.floor(float(score_match.group(1)))
         alignments = [x[1] for x in alignment_match]
         assert len(alignments) == 2, f"Expected 2 alignments, got {len(alignments)}"
 
@@ -212,9 +212,7 @@ def test_against_levenshtein(min_length: int, max_length: int):
 
     lev1, lev2 = colorize_alignment(lev1, lev2)
     nw1, nw2 = colorize_alignment(nw1, nw2)
-    assert (
-        lev_score == -nw_score and lev_score == -only_score
-    ), f"""
+    assert lev_score == -nw_score and lev_score == -only_score, f"""
     Levenshtein and Needleman-Wunsch should return the same score.
     Levenshtein scored {lev_score}:
         {lev1}
@@ -274,9 +272,7 @@ def test_scoring_vs_alignment(
     )
 
     colored1, colored2 = colorize_alignment(aligned1, aligned2)
-    assert (
-        aligned_score == only_score
-    ), f"""
+    assert aligned_score == only_score, f"""
     Alignment ({aligned_score}) and pure scoring ({only_score}) functions must return identical results for:
         {colored1}
         {colored2}
@@ -306,7 +302,7 @@ def test_gap_expansions(
     str1 = "".join(choice(alphabet) for _ in range(randint(min_length, max_length)))
     str2 = "".join(choice(alphabet) for _ in range(randint(min_length, max_length)))
 
-    aligned1, aligned2, score = needleman_wunsch_gotoh_alignment(
+    aligned1, aligned2, _score = needleman_wunsch_gotoh_alignment(
         str1,
         str2,
         substitution_alphabet=alphabet,
@@ -354,13 +350,11 @@ def test_gap_expansions(
             match=match_score,
             mismatch=mismatch_score,
         )
-        assert (
-            wide_gapped_score == aig_gapped_score
-        ), f"""
+        assert wide_gapped_score == aig_gapped_score, f"""
         Expected score:     {aig_gapped_score}
         Expected alignment: {colorize_alignment(air_gapped_aligned1, air_gapped_aligned2)[0]}
                             {colorize_alignment(air_gapped_aligned1, air_gapped_aligned2)[1]}
-        
+
         Gap width:          {gap_width}
         Actual score:       {wide_gapped_score}
         Final alignment:    {colorize_alignment(wide_gapped_aligned1, wide_gapped_aligned2)[0]}
@@ -389,8 +383,8 @@ def test_gap_expansions(
 )
 @pytest.mark.parametrize("mode", ["global", "local"])
 def test_against_biopython_examples(
-    pair: Tuple[str, str],
-    scores: Tuple[int, int, int, int],
+    pair: tuple[str, str],
+    scores: tuple[int, int, int, int],
     mode: Literal["global", "local"],
 ):
     """
@@ -448,7 +442,7 @@ def test_against_biopython_examples(
 def test_against_biopython_fuzzy(
     first_length: int,
     second_length: int,
-    gap_scores: Tuple[int, int],
+    gap_scores: tuple[int, int],
     mode: Literal["global", "local"],
 ):
     """
