@@ -848,6 +848,7 @@ struct Crossing(ImplicitlyCopyable, TrivialRegisterPassable):
     var plain: Int32
     var plain_column: Int
     var gapped: Int32
+    var gapped_column: Int
 
 
 def tile_frame(
@@ -887,7 +888,7 @@ def best_crossing(
     scoring: AffineGapCosts,
 ) -> Crossing:
     """Scans the two frontiers for the best cut, in the match layer and across a straddling run."""
-    var best = Crossing(NEGATIVE_INFINITY, 0, NEGATIVE_INFINITY)
+    var best = Crossing(NEGATIVE_INFINITY, 0, NEGATIVE_INFINITY, 0)
     var refund = scoring.extend - scoring.open
     for offset in range(width + 1):
         var plain = forward_scores[offset] + reverse_scores[width - offset]
@@ -897,6 +898,7 @@ def best_crossing(
         var gapped = forward_deletes[offset] + reverse_deletes[width - offset] + refund
         if gapped > best.gapped:
             best.gapped = gapped
+            best.gapped_column = offset
     return best
 
 
@@ -1004,27 +1006,20 @@ def hirschberg_window(
         var best_plain = join.plain
         var best_plain_column = join.plain_column
         var best_gapped = join.gapped
+        var best_gapped_column = join.gapped_column
 
-        # Take the answer from the branch actually followed. The gapped candidate can overshoot
-        # the true optimum on degenerate rectangles, where the delete layers at the extreme
-        # columns are still sentinels rather than reachable values.
-        if best_gapped > best_plain:
-            tile_frame(
-                first,
-                second,
-                frame,
-                substitutions,
-                alphabet_size,
-                scoring,
-                path_columns,
-                path_entries,
-            )
-            continue
-
-        var crossing = second_from + best_plain_column
+        # Either the path crosses the cut in the aligning layer, or it crosses inside a deletion
+        # run. Both are ordinary, and the second is what the boundary flags exist to carry: the
+        # two halves each charged an opening for their part of the run, the refund removes one,
+        # and both children are told the run is already open at the edge they share.
+        var crosses_in_a_gap = best_gapped > best_plain
+        var crossing = second_from + (
+            best_gapped_column if crosses_in_a_gap else best_plain_column
+        )
+        var shared_edge = GapRun.EXTENDS if crosses_in_a_gap else GapRun.OPENS
         # Lower half first, so the upper half pops first and the two row ranges tile in order.
-        frames.append(Frame(split, first_to, crossing, second_to, GapRun.OPENS, bottom))
-        frames.append(Frame(first_from, split, second_from, crossing, top, GapRun.OPENS))
+        frames.append(Frame(split, first_to, crossing, second_to, shared_edge, bottom))
+        frames.append(Frame(first_from, split, second_from, crossing, top, shared_edge))
 
 
 def score_path(
@@ -1810,31 +1805,25 @@ def hirschberg_path_gpu(
         var best_plain = NEGATIVE_INFINITY
         var best_plain_column = 0
         var best_gapped = NEGATIVE_INFINITY
+        var best_gapped_column = 0
         with buffers.crossing.map_to_host() as host:
             best_plain = host[0]
             best_plain_column = Int(host[1])
             best_gapped = host[2]
+            best_gapped_column = Int(host[3])
 
-        # Take the answer from the branch actually followed. The gapped candidate can overshoot
-        # the true optimum on degenerate rectangles, where the delete layers at the extreme
-        # columns are still sentinels rather than reachable values.
-        if best_gapped > best_plain:
-            tile_frame(
-                first,
-                second,
-                frame,
-                substitutions,
-                alphabet_size,
-                scoring,
-                path_columns,
-                path_entries,
-            )
-            continue
-
-        var crossing = second_from + best_plain_column
+        # Either the path crosses the cut in the aligning layer, or it crosses inside a deletion
+        # run. Both are ordinary, and the second is what the boundary flags exist to carry: the
+        # two halves each charged an opening for their part of the run, the refund removes one,
+        # and both children are told the run is already open at the edge they share.
+        var crosses_in_a_gap = best_gapped > best_plain
+        var crossing = second_from + (
+            best_gapped_column if crosses_in_a_gap else best_plain_column
+        )
+        var shared_edge = GapRun.EXTENDS if crosses_in_a_gap else GapRun.OPENS
         # Lower half first, so the upper half pops first and the two row ranges tile in order.
-        frames.append(Frame(split, first_to, crossing, second_to, GapRun.OPENS, bottom))
-        frames.append(Frame(first_from, split, second_from, crossing, top, GapRun.OPENS))
+        frames.append(Frame(split, first_to, crossing, second_to, shared_edge, bottom))
+        frames.append(Frame(first_from, split, second_from, crossing, top, shared_edge))
 
 
 def local_extremum_kernel[
@@ -2111,11 +2100,12 @@ def crossing_kernel(
     """Picks where the optimal path crosses the cut, without shipping two bands to the host.
 
     Reading four frontier arrays back per split costs more than the sweeps themselves once the
-    recursion is thousands of nodes deep, so the reduction happens here and three numbers travel.
+    recursion is thousands of nodes deep, so the reduction happens here and four numbers travel.
     """
     var best_plain = NEGATIVE_INFINITY
     var best_plain_column = Int32(0)
     var best_gapped = NEGATIVE_INFINITY
+    var best_gapped_column = Int32(0)
     var span = Int(width)
     for offset in range(span + 1):
         var plain = forward_scores[unsafe_offset=offset] + reverse_scores[unsafe_offset=span - offset]
@@ -2125,9 +2115,11 @@ def crossing_kernel(
         var gapped = forward_deletes[unsafe_offset=offset] + reverse_deletes[unsafe_offset=span - offset] + refund
         if gapped > best_gapped:
             best_gapped = gapped
+            best_gapped_column = Int32(offset)
     crossing[unsafe_offset=0] = best_plain
     crossing[unsafe_offset=1] = best_plain_column
     crossing[unsafe_offset=2] = best_gapped
+    crossing[unsafe_offset=3] = best_gapped_column
 
 
 def tiled_sweep[
