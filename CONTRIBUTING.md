@@ -21,14 +21,14 @@ uv run pytest test.py           # To run the tests
 The GPU kernels are optional. Build them with `pixi run build` and the same suite picks them up; without a build, every Mojo test skips and the pure-Python suite still runs.
 
 ```sh
-pixi run test                        # builds the extension, then runs the suite against it
-pytest test.py --backends=numpy-cpu  # the reference alone, which is what CI runs
+pixi run test                                  # builds the extension, then runs the suite against it
+AFFINEGAPS_BACKENDS=python-cpu pixi run pytest # the reference alone, which is what CI runs
 ```
 
-Every property test runs against each backend, named `numpy-cpu`, `mojo-cpu` and `mojo-gpu`.
+Every property test runs against each backend, named `python-cpu`, `numba-cpu`, `mojo-cpu` and `mojo-gpu`.
 A backend the machine cannot serve is skipped rather than failed, and the skip reason carries the real cause — a missing build and an unsupported driver are different problems and say so.
 
-The Mojo kernels and the NumPy reference are held to the same recurrence, the same border initialization and the same tie-breaking, so the suite compares them exhaustively rather than by sampling — every pair of sequences up to length five over a three-letter alphabet, both global and local, on the host and on the device.
+The Mojo kernels and the Python reference are held to the same recurrence, the same border initialization and the same tie-breaking, so the suite compares them exhaustively rather than by sampling — every pair of sequences up to length five over a three-letter alphabet, both global and local, on the host and on the device.
 
 ### Every Path Must Achieve Its Own Score
 

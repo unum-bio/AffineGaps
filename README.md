@@ -117,7 +117,7 @@ Naming neither picks the fastest the machine offers.
 
 ```python
 needleman_wunsch_gotoh_alignment(insulin, glucagon)                            # fastest available
-needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="numpy")           # the reference
+needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="python")           # the reference
 needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="mojo")            # compiled, host
 needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="mojo", device="gpu")
 ```
@@ -138,10 +138,17 @@ if available("mojo", "gpu"):
 ```
 
 By default a BLOSUM62 substitution matrix scaled by five is used.
-You can specify a different substitution matrix by passing it as an argument.
+Costs come in two records: the gap model, and either a uniform pair of scores or a table.
 
 ```python
 import numpy as np
+from affinegaps import AffineGapCosts, UniformSubstitutionCosts, TabulatedSubstitutionCosts
+
+aligned_insulin, aligned_glucagon, score = needleman_wunsch_gotoh_alignment(
+    insulin, glucagon,
+    substitution=UniformSubstitutionCosts(match=1, mismatch=-1),
+    gaps=AffineGapCosts(open=-2, extend=-1),
+)
 
 alphabet = "ARNDCQEGHILKMFPSTWYVBZX"
 substitutions = np.full((len(alphabet), len(alphabet)), -1, dtype=np.int8)
@@ -149,12 +156,13 @@ np.fill_diagonal(substitutions, 1)
 
 aligned_insulin, aligned_glucagon, score = needleman_wunsch_gotoh_alignment(
     insulin, glucagon,
-    substitution_alphabet=alphabet,
-    substitution_matrix=substitutions,
-    gap_opening=-2,
-    gap_extension=-1,
+    substitution=TabulatedSubstitutionCosts(alphabet, substitutions),
+    gaps=AffineGapCosts(open=-2, extend=-1),
 )
 ```
+
+A uniform cost carries its match and its mismatch together, and a table carries its matrix and
+the alphabet indexing it, so neither can be half-specified and the two cannot be combined.
 
 That is similar to the following usage example of BioPython:
 

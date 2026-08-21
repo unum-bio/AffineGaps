@@ -210,11 +210,11 @@ def translate(text: String, alphabet: String) raises -> List[Scalar[SYMBOL_DTYPE
 
 
 @fieldwise_init
-struct AffineScoring(Copyable, Movable):
+struct AffineGapCosts(Copyable, Movable):
     """Gotoh's two-parameter gap model. Both penalties are negative."""
 
-    var gap_opening: Int32
-    var gap_extension: Int32
+    var open: Int32
+    var extend: Int32
 
 
 @fieldwise_init
@@ -245,15 +245,15 @@ def gotoh_cell[
     left: Int32,
     left_insert: Int32,
     substitution: Int32,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
 ) -> Cell:
     """One interior cell of the Gotoh recurrence, with the local clamp folded in at comptime.
 
     This is the single transcription of the recurrence that `affinegaps.py` holds as the oracle;
     every sweep on the host and on the device goes through it.
     """
-    var deletion = max(above + scoring.gap_opening, above_delete + scoring.gap_extension)
-    var insertion = max(left + scoring.gap_opening, left_insert + scoring.gap_extension)
+    var deletion = max(above + scoring.open, above_delete + scoring.extend)
+    var insertion = max(left + scoring.open, left_insert + scoring.extend)
     var score = max(max(diagonal + substitution, deletion), insertion)
     comptime if mode == AlignmentMode.LOCAL:
         score = max(score, Int32(0))
@@ -368,16 +368,16 @@ struct CellDecision(ImplicitlyCopyable, TrivialRegisterPassable):
 
 
 @always_inline
-def decide(cell: Cell, replacement: Int32, above: Cell, left: Cell, scoring: AffineScoring) -> CellDecision:
+def decide(cell: Cell, replacement: Int32, above: Cell, left: Cell, scoring: AffineGapCosts) -> CellDecision:
     """The four answers a kernel packs, re-derived from the three score layers."""
     var deletion_run = (
         GapRun.EXTENDS
-        if above.deletion + scoring.gap_extension > above.score + scoring.gap_opening
+        if above.deletion + scoring.extend > above.score + scoring.open
         else GapRun.OPENS
     )
     var insertion_run = (
         GapRun.EXTENDS
-        if left.insertion + scoring.gap_extension > left.score + scoring.gap_opening
+        if left.insertion + scoring.extend > left.score + scoring.open
         else GapRun.OPENS
     )
     var reach = PathReach.ENDS_HERE if cell.score <= 0 else PathReach.CONTINUES_PAST
@@ -425,7 +425,7 @@ def serial_score[
     second: List[Scalar[SYMBOL_DTYPE]],
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
 ) -> Int32:
     """Two-row reference, transcribed from the `*_score_kernel` functions of `affinegaps.py`."""
     var rows = len(first)
@@ -440,19 +440,19 @@ def serial_score[
     scores_above[0] = 0
     for column in range(1, columns + 1):
         if mode == AlignmentMode.GLOBAL:
-            scores_above[column] = scoring.gap_opening + Int32(column - 1) * scoring.gap_extension
-            deletes_above[column] = scores_above[column] + scoring.gap_opening + scoring.gap_extension
+            scores_above[column] = scoring.open + Int32(column - 1) * scoring.extend
+            deletes_above[column] = scores_above[column] + scoring.open + scoring.extend
         else:
             scores_above[column] = 0
-            deletes_above[column] = scoring.gap_opening + scoring.gap_extension
+            deletes_above[column] = scoring.open + scoring.extend
 
     var best = Int32(0)
     for row in range(1, rows + 1):
         if mode == AlignmentMode.GLOBAL:
-            scores_row[0] = scoring.gap_opening + Int32(row - 1) * scoring.gap_extension
+            scores_row[0] = scoring.open + Int32(row - 1) * scoring.extend
         else:
             scores_row[0] = 0
-        inserts_row[0] = scores_row[0] + scoring.gap_opening + scoring.gap_extension
+        inserts_row[0] = scores_row[0] + scoring.open + scoring.extend
 
         for column in range(1, columns + 1):
             var substitution = Int32(
@@ -489,7 +489,7 @@ def serial_align[
     second: List[Scalar[SYMBOL_DTYPE]],
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
     alphabet: String,
 ) -> AlignmentResult:
     """Full-matrix reference, transcribed from the `_*_kernel` plus `_reconstruct_alignment`."""
@@ -504,11 +504,11 @@ def serial_align[
     scores[0] = 0
     for column in range(1, stride):
         if mode == AlignmentMode.GLOBAL:
-            scores[column] = scoring.gap_opening + Int32(column - 1) * scoring.gap_extension
-            deletes[column] = scores[column] + scoring.gap_opening + scoring.gap_extension
+            scores[column] = scoring.open + Int32(column - 1) * scoring.extend
+            deletes[column] = scores[column] + scoring.open + scoring.extend
         else:
             scores[column] = 0
-            deletes[column] = scoring.gap_opening + scoring.gap_extension
+            deletes[column] = scoring.open + scoring.extend
 
     var best = Int32(0)
     var best_row = 0
@@ -518,11 +518,11 @@ def serial_align[
         var base = row * stride
         var above = base - stride
         if mode == AlignmentMode.GLOBAL:
-            scores[base] = scoring.gap_opening + Int32(row - 1) * scoring.gap_extension
-            inserts[base] = scores[base] + scoring.gap_opening + scoring.gap_extension
+            scores[base] = scoring.open + Int32(row - 1) * scoring.extend
+            inserts[base] = scores[base] + scoring.open + scoring.extend
         else:
             scores[base] = 0
-            inserts[base] = scoring.gap_opening + scoring.gap_extension
+            inserts[base] = scoring.open + scoring.extend
 
         for column in range(1, stride):
             var substitution = Int32(
@@ -584,7 +584,7 @@ def reconstruct(
     start_row: Int,
     start_column: Int,
     alphabet: String,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
     mode: AlignmentMode,
 ) -> Tuple[String, String]:
     """Three-state backward walk over the match, deletion and insertion layers.
@@ -689,7 +689,7 @@ def sweep_bands[
     entry: GapRun,
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
     mut final_scores: List[Int32],
     mut final_deletes: List[Int32],
 ):
@@ -707,21 +707,21 @@ def sweep_bands[
     var inserts_row = List[Int32](length=columns + 1, fill=Int32(0))
 
     scores_above[0] = 0
-    deletes_above[0] = scoring.gap_opening + scoring.gap_extension
+    deletes_above[0] = scoring.open + scoring.extend
     for column in range(1, columns + 1):
-        scores_above[column] = scoring.gap_opening + Int32(column - 1) * scoring.gap_extension
+        scores_above[column] = scoring.open + Int32(column - 1) * scoring.extend
         if entry == GapRun.EXTENDS:
             deletes_above[column] = scores_above[column]
         else:
-            deletes_above[column] = scores_above[column] + scoring.gap_opening + scoring.gap_extension
+            deletes_above[column] = scores_above[column] + scoring.open + scoring.extend
 
     for row in range(1, rows + 1):
         if entry == GapRun.EXTENDS:
-            scores_row[0] = Int32(row) * scoring.gap_extension
+            scores_row[0] = Int32(row) * scoring.extend
         else:
-            scores_row[0] = scoring.gap_opening + Int32(row - 1) * scoring.gap_extension
+            scores_row[0] = scoring.open + Int32(row - 1) * scoring.extend
         deletes_row[0] = scores_row[0]
-        inserts_row[0] = scores_row[0] + scoring.gap_opening + scoring.gap_extension
+        inserts_row[0] = scores_row[0] + scoring.open + scoring.extend
 
         comptime reversed_order = half == SweepHalf.REVERSE
         var first_index = first_to - row if reversed_order else first_from + row - 1
@@ -762,7 +762,7 @@ def direct_tile(
     bottom: GapRun,
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
     mut path_columns: List[Int32],
     mut path_entries: List[Layer],
 ) -> Int32:
@@ -782,21 +782,21 @@ def direct_tile(
 
     scores[0] = 0
     for column in range(1, stride):
-        scores[column] = scoring.gap_opening + Int32(column - 1) * scoring.gap_extension
+        scores[column] = scoring.open + Int32(column - 1) * scoring.extend
         if top == GapRun.EXTENDS:
             deletes[column] = scores[column]
         else:
-            deletes[column] = scores[column] + scoring.gap_opening + scoring.gap_extension
+            deletes[column] = scores[column] + scoring.open + scoring.extend
 
     for row in range(1, rows + 1):
         var base = row * stride
         var above = base - stride
         if top == GapRun.EXTENDS:
-            scores[base] = Int32(row) * scoring.gap_extension
+            scores[base] = Int32(row) * scoring.extend
         else:
-            scores[base] = scoring.gap_opening + Int32(row - 1) * scoring.gap_extension
+            scores[base] = scoring.open + Int32(row - 1) * scoring.extend
         deletes[base] = scores[base]
-        inserts[base] = scores[base] + scoring.gap_opening + scoring.gap_extension
+        inserts[base] = scores[base] + scoring.open + scoring.extend
         for column in range(1, stride):
             var substitution = Int32(
                 substitutions[
@@ -822,7 +822,7 @@ def direct_tile(
     var state = Layer.ALIGNING
     if bottom == GapRun.EXTENDS:
         var corner = row * stride + column
-        if deletes[corner] + scoring.gap_extension - scoring.gap_opening > scores[corner]:
+        if deletes[corner] + scoring.extend - scoring.open > scores[corner]:
             state = Layer.DELETING
 
     # Only a row-consuming step records anything, so sibling subproblems tile the row axis.
@@ -868,7 +868,7 @@ def hirschberg_window(
     window_second_to: Int,
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
     tile_cells: Int,
     mut path_columns: List[Int32],
     mut path_entries: List[Layer],
@@ -880,7 +880,7 @@ def hirschberg_window(
     are joined by Myers-Miller: either the path crosses in the match layer, or a deletion run
     straddles the cut, in which case both halves charged an opening and one is refunded.
     """
-    if scoring.gap_opening > scoring.gap_extension:
+    if scoring.open > scoring.extend:
         raise Error("Gap opening must be at least as expensive as extension for the row split.")
 
     var columns = window_second_to - window_second_from
@@ -932,7 +932,7 @@ def hirschberg_window(
         var best_plain = NEGATIVE_INFINITY
         var best_plain_column = 0
         var best_gapped = NEGATIVE_INFINITY
-        var refund = scoring.gap_extension - scoring.gap_opening
+        var refund = scoring.extend - scoring.open
         for offset in range(width + 1):
             var plain = forward_scores[offset] + reverse_scores[width - offset]
             if plain > best_plain:
@@ -965,7 +965,7 @@ def score_path(
     path_entries: List[Layer],
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
     rows: Int,
 ) -> Int32:
     """Scores a reconstructed path under the affine rule, in time linear in the alignment.
@@ -979,7 +979,7 @@ def score_path(
     var in_second = False
 
     for _ in range(Int(path_columns[0])):
-        total += scoring.gap_extension if in_first else scoring.gap_opening
+        total += scoring.extend if in_first else scoring.open
         in_first = True
         in_second = False
 
@@ -987,7 +987,7 @@ def score_path(
         var before = Int(path_columns[row - 1])
         var after = Int(path_columns[row])
         if path_entries[row] == Layer.DELETING:
-            total += scoring.gap_extension if in_second else scoring.gap_opening
+            total += scoring.extend if in_second else scoring.open
             in_first = False
             in_second = True
         else:
@@ -998,7 +998,7 @@ def score_path(
             in_first = False
             in_second = False
         for _ in range(before, after):
-            total += scoring.gap_extension if in_first else scoring.gap_opening
+            total += scoring.extend if in_first else scoring.open
             in_first = True
             in_second = False
 
@@ -1054,7 +1054,7 @@ def local_extremum[
     second_to: Int,
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
 ) -> Tuple[Int, Int, Int32]:
     """Linear-space local sweep returning the first row-major maximum and its value.
 
@@ -1069,7 +1069,7 @@ def local_extremum[
     var inserts_row = List[Int32](length=second_to + 1, fill=Int32(0))
 
     for column in range(1, second_to + 1):
-        deletes_above[column] = scoring.gap_opening + scoring.gap_extension
+        deletes_above[column] = scoring.open + scoring.extend
 
     var best = Int32(0)
     var best_row = 0
@@ -1077,7 +1077,7 @@ def local_extremum[
 
     for row in range(1, first_to + 1):
         scores_row[0] = 0
-        inserts_row[0] = scoring.gap_opening + scoring.gap_extension
+        inserts_row[0] = scoring.open + scoring.extend
         comptime reversed_order = half == SweepHalf.REVERSE
         var first_index = first_to - row if reversed_order else row - 1
         for column in range(1, second_to + 1):
@@ -1154,8 +1154,8 @@ def wavefront_kernel[
     substitutions: Pointer[Scalar[SUBSTITUTION_DTYPE], MutAnyOrigin],
     results: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
     alphabet_size: Int32,
-    gap_opening: Int32,
-    gap_extension: Int32,
+    open: Int32,
+    extend: Int32,
 ):
     """One block per pair, one thread per cell of the live anti-diagonal.
 
@@ -1165,7 +1165,7 @@ def wavefront_kernel[
     """
     var pair = Int(block_idx.x)
     var first_start = Int(offsets[unsafe_offset=2 * pair])
-    var scoring = AffineScoring(gap_opening, gap_extension)
+    var scoring = AffineGapCosts(open, extend)
     var second_start = Int(offsets[unsafe_offset=2 * pair + 1])
     var rows = second_start - first_start
     var columns = Int(offsets[unsafe_offset=2 * pair + 2]) - second_start
@@ -1204,23 +1204,23 @@ def wavefront_kernel[
 
             if row == 0 and column == 0:
                 cell = 0
-                deletion = cell + gap_opening + gap_extension
+                deletion = cell + open + extend
                 insertion = deletion
             elif row == 0:
                 if mode == AlignmentMode.GLOBAL:
-                    cell = gap_opening + Int32(column - 1) * gap_extension
-                    deletion = cell + gap_opening + gap_extension
+                    cell = open + Int32(column - 1) * extend
+                    deletion = cell + open + extend
                 else:
                     cell = 0
-                    deletion = gap_opening + gap_extension
+                    deletion = open + extend
                 insertion = deletion
             elif column == 0:
                 if mode == AlignmentMode.GLOBAL:
-                    cell = gap_opening + Int32(row - 1) * gap_extension
-                    insertion = cell + gap_opening + gap_extension
+                    cell = open + Int32(row - 1) * extend
+                    insertion = cell + open + extend
                 else:
                     cell = 0
-                    insertion = gap_opening + gap_extension
+                    insertion = open + extend
                 deletion = insertion
             else:
                 var left_symbol = Int(sequences[unsafe_offset=first_start + row - 1])
@@ -1286,7 +1286,7 @@ def wavefront_scores[
     offsets: List[Scalar[OFFSET_DTYPE]],
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
 ) raises -> List[Int32]:
     """Scores every pair in the batch, one thread block each."""
     var pairs = (len(offsets) - 1) // 2
@@ -1303,8 +1303,8 @@ def wavefront_scores[
         substitutions_buffer.unsafe_ptr(),
         results_buffer.unsafe_ptr(),
         Int32(alphabet_size),
-        scoring.gap_opening,
-        scoring.gap_extension,
+        scoring.open,
+        scoring.extend,
         grid_dim=pairs,
         block_dim=THREADS_PER_BLOCK,
     )
@@ -1332,8 +1332,8 @@ def direct_align_kernel[
     gapped_lengths: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
     gapped_stride: Int32,
     alphabet_size: Int32,
-    gap_opening: Int32,
-    gap_extension: Int32,
+    open: Int32,
+    extend: Int32,
 ):
     """Anti-diagonal sweep that records every decision, then walks it back on the device.
 
@@ -1343,7 +1343,7 @@ def direct_align_kernel[
     """
     var pair = Int(block_idx.x)
     var first_start = Int(offsets[unsafe_offset=2 * pair])
-    var scoring = AffineScoring(gap_opening, gap_extension)
+    var scoring = AffineGapCosts(open, extend)
     var second_start = Int(offsets[unsafe_offset=2 * pair + 1])
     var rows = second_start - first_start
     var columns = Int(offsets[unsafe_offset=2 * pair + 2]) - second_start
@@ -1394,23 +1394,23 @@ def direct_align_kernel[
 
             if row == 0 and column == 0:
                 cell = 0
-                deletion = cell + gap_opening + gap_extension
+                deletion = cell + open + extend
                 insertion = deletion
             elif row == 0:
                 if mode == AlignmentMode.GLOBAL:
-                    cell = gap_opening + Int32(column - 1) * gap_extension
-                    deletion = cell + gap_opening + gap_extension
+                    cell = open + Int32(column - 1) * extend
+                    deletion = cell + open + extend
                 else:
                     cell = 0
-                    deletion = gap_opening + gap_extension
+                    deletion = open + extend
                 insertion = deletion
             elif column == 0:
                 if mode == AlignmentMode.GLOBAL:
-                    cell = gap_opening + Int32(row - 1) * gap_extension
-                    insertion = cell + gap_opening + gap_extension
+                    cell = open + Int32(row - 1) * extend
+                    insertion = cell + open + extend
                 else:
                     cell = 0
-                    insertion = gap_opening + gap_extension
+                    insertion = open + extend
                 deletion = insertion
             else:
                 var left_symbol = Int(sequences[unsafe_offset=first_start + row - 1])
@@ -1432,12 +1432,12 @@ def direct_align_kernel[
                 deletion = computed.deletion
                 insertion = computed.insertion
                 var deletion_run = (
-                    GapRun.EXTENDS if wavefront.deletes_one_back[unsafe_offset=row - 1] + gap_extension
-                    > wavefront.scores_one_back[unsafe_offset=row - 1] + gap_opening else GapRun.OPENS
+                    GapRun.EXTENDS if wavefront.deletes_one_back[unsafe_offset=row - 1] + extend
+                    > wavefront.scores_one_back[unsafe_offset=row - 1] + open else GapRun.OPENS
                 )
                 var insertion_run = (
-                    GapRun.EXTENDS if wavefront.inserts_one_back[unsafe_offset=row] + gap_extension
-                    > wavefront.scores_one_back[unsafe_offset=row] + gap_opening else GapRun.OPENS
+                    GapRun.EXTENDS if wavefront.inserts_one_back[unsafe_offset=row] + extend
+                    > wavefront.scores_one_back[unsafe_offset=row] + open else GapRun.OPENS
                 )
                 var reach = PathReach.CONTINUES_PAST
                 comptime if mode == AlignmentMode.LOCAL:
@@ -1540,7 +1540,7 @@ def direct_alignments[
     offsets: List[Scalar[OFFSET_DTYPE]],
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet: String,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
 ) raises -> List[AlignmentResult]:
     """Aligns a batch on the GPU by recording every decision, one thread block per pair."""
     var alphabet_bytes = alphabet.as_bytes()
@@ -1588,8 +1588,8 @@ def direct_alignments[
         lengths_buffer.unsafe_ptr(),
         Int32(widest),
         Int32(alphabet_size),
-        scoring.gap_opening,
-        scoring.gap_extension,
+        scoring.open,
+        scoring.extend,
         grid_dim=pairs,
         block_dim=THREADS_PER_BLOCK,
     )
@@ -1625,7 +1625,7 @@ def hirschberg_path_gpu(
     window_second_to: Int,
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
     tile_cells: Int,
     mut path_columns: List[Int32],
     mut path_entries: List[Layer],
@@ -1637,7 +1637,7 @@ def hirschberg_path_gpu(
     by shared memory. Each launch is its own barrier, which is what stands in for the grid-wide sync
     Mojo does not expose.
     """
-    if scoring.gap_opening > scoring.gap_extension:
+    if scoring.open > scoring.extend:
         raise Error("Gap opening must be at least as expensive as extension for the row split.")
 
     var rows = len(first)
@@ -1713,7 +1713,7 @@ def hirschberg_path_gpu(
             buffers.reverse_deletes.unsafe_ptr(),
             buffers.crossing.unsafe_ptr(),
             Int32(width),
-            scoring.gap_extension - scoring.gap_opening,
+            scoring.extend - scoring.open,
             grid_dim=1,
             block_dim=1,
         )
@@ -1755,8 +1755,8 @@ def local_extremum_kernel[
     second_from: Int32,
     second_to: Int32,
     alphabet_size: Int32,
-    gap_opening: Int32,
-    gap_extension: Int32,
+    open: Int32,
+    extend: Int32,
 ):
     """Local sweep reporting the first row-major maximum, with its bands in global memory.
 
@@ -1769,7 +1769,7 @@ def local_extremum_kernel[
     var width = Int(alphabet_size)
     var stride = rows + 1
     comptime reversed_order = half == SweepHalf.REVERSE
-    var scoring = AffineScoring(gap_opening, gap_extension)
+    var scoring = AffineGapCosts(open, extend)
 
     var scores_table = stack_allocation[
         MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE,
@@ -1799,8 +1799,8 @@ def local_extremum_kernel[
         for row in range(row_low + Int(thread_idx.x), row_high + 1, Int(block_dim.x)):
             var column = diagonal - row
             var cell = Int32(0)
-            var deletion = gap_opening + gap_extension
-            var insertion = gap_opening + gap_extension
+            var deletion = open + extend
+            var insertion = open + extend
 
             if row > 0 and column > 0:
                 var left_index = (
@@ -1876,8 +1876,8 @@ def tiled_sweep_kernel[
     second_from: Int32,
     entry_identifier: UInt8,
     alphabet_size: Int32,
-    gap_opening: Int32,
-    gap_extension: Int32,
+    open: Int32,
+    extend: Int32,
 ):
     """One tile of the matrix per block, one tile-anti-diagonal per launch.
 
@@ -1899,7 +1899,7 @@ def tiled_sweep_kernel[
     var stride = TILE_SIDE + 1
     comptime reversed_order = half == SweepHalf.REVERSE
     var extends = GapRun(entry_identifier) == GapRun.EXTENDS
-    var scoring = AffineScoring(gap_opening, gap_extension)
+    var scoring = AffineGapCosts(open, extend)
 
     var bands = stack_allocation[
         BANDS_PER_SWEEP * (TILE_SIDE + 1), Scalar[SCORE_DTYPE], address_space = AddressSpace.SHARED
@@ -1925,40 +1925,40 @@ def tiled_sweep_kernel[
             var row = row_begin + local_row
             var column = column_begin + local_column
             var cell = Int32(0)
-            var deletion = gap_opening + gap_extension
-            var insertion = gap_opening + gap_extension
+            var deletion = open + extend
+            var insertion = open + extend
 
             if local_row == 0 or local_column == 0:
                 # A tile edge. Outside the matrix it is the affine ramp; inside it is whatever the
                 # neighbouring tile left behind.
                 if row == 0 and column == 0:
                     cell = 0
-                    deletion = gap_opening + gap_extension
+                    deletion = open + extend
                     insertion = deletion
                 elif row == 0:
-                    cell = gap_opening + Int32(column - 1) * gap_extension
-                    deletion = cell if extends else cell + gap_opening + gap_extension
+                    cell = open + Int32(column - 1) * extend
+                    deletion = cell if extends else cell + open + extend
                     insertion = deletion
                 elif column == 0:
-                    cell = Int32(row) * gap_extension if extends else gap_opening + Int32(
+                    cell = Int32(row) * extend if extends else open + Int32(
                         row - 1
-                    ) * gap_extension
+                    ) * extend
                     deletion = cell
-                    insertion = cell + gap_opening + gap_extension
+                    insertion = cell + open + extend
                 elif local_row == 0 and local_column == 0:
                     cell = corner_scores[
                         unsafe_offset=tile_row * Int(tile_columns_count) + tile_column
                     ]
-                    deletion = cell + gap_opening + gap_extension
+                    deletion = cell + open + extend
                     insertion = deletion
                 elif local_row == 0:
                     cell = top_scores[unsafe_offset=column]
                     deletion = top_deletes[unsafe_offset=column]
-                    insertion = cell + gap_opening + gap_extension
+                    insertion = cell + open + extend
                 else:
                     cell = left_scores[unsafe_offset=row]
                     insertion = left_inserts[unsafe_offset=row]
-                    deletion = cell + gap_opening + gap_extension
+                    deletion = cell + open + extend
             else:
                 var left_index = (
                     Int(first_from) + Int(rows) - row if reversed_order else Int(first_from) + row - 1
@@ -2073,7 +2073,7 @@ def tiled_sweep[
     second_from: Int,
     entry: GapRun,
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
 ) raises:
     """Sweeps one sub-rectangle as a wavefront of tiles, one launch per tile-anti-diagonal.
 
@@ -2110,8 +2110,8 @@ def tiled_sweep[
             Int32(second_from),
             entry.identifier,
             Int32(alphabet_size),
-            scoring.gap_opening,
-            scoring.gap_extension,
+            scoring.open,
+            scoring.extend,
             grid_dim=tiles,
             block_dim=THREADS_PER_BLOCK,
         )
@@ -2159,11 +2159,11 @@ def optional_int(value: PythonObject) -> Optional[Int]:
         return None
 
 
-def scoring_from(gaps: PythonObject) raises -> AffineScoring:
+def scoring_from(gaps: PythonObject) raises -> AffineGapCosts:
     """Reads the two gap penalties off a caller's gap-cost record by name."""
     var opening = optional_int(gaps.open).or_else(Int(DEFAULT_GAP_OPENING))
     var extension = optional_int(gaps.extend).or_else(Int(DEFAULT_GAP_EXTENSION))
-    return AffineScoring(Int32(opening), Int32(extension))
+    return AffineGapCosts(Int32(opening), Int32(extension))
 
 
 def matrix_from(substitution: PythonObject, alphabet_size: Int) raises -> List[Scalar[SUBSTITUTION_DTYPE]]:
@@ -2235,7 +2235,12 @@ def gotoh_scores_batch[
     substitution: PythonObject,
     gaps: PythonObject,
 ) raises -> PythonObject:
-    """Scores a whole batch on the GPU, one thread block per pair."""
+    """Scores a whole batch on the GPU, one thread block per pair.
+
+    Both sides are packed into one Arrow-like tape — every sequence concatenated into a flat
+    symbol buffer, with an offset array carrying two entries per pair — so a batch reaches the
+    device as two buffers rather than as one transfer per sequence.
+    """
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
     var scoring = scoring_from(gaps)
@@ -2247,6 +2252,7 @@ def gotoh_scores_batch[
     if pairs == 0:
         return Python().list()
 
+    # The tape: symbols concatenated end to end, offsets marking where each sequence starts.
     var sequences = List[Scalar[SYMBOL_DTYPE]]()
     var offsets = List[Scalar[OFFSET_DTYPE]]()
     offsets.append(0)
@@ -2278,7 +2284,10 @@ def gotoh_alignments_batch[
     substitution: PythonObject,
     gaps: PythonObject,
 ) raises -> PythonObject:
-    """Aligns a whole batch on the GPU, returning `[first_gapped, second_gapped, score]` triples."""
+    """Aligns a whole batch on the GPU, returning `[first_gapped, second_gapped, score]` triples.
+
+    Packed into the same Arrow-like tape the scoring batch uses.
+    """
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
     var scoring = scoring_from(gaps)
@@ -2290,6 +2299,7 @@ def gotoh_alignments_batch[
     if pairs == 0:
         return Python().list()
 
+    # The tape: symbols concatenated end to end, offsets marking where each sequence starts.
     var sequences = List[Scalar[SYMBOL_DTYPE]]()
     var offsets = List[Scalar[OFFSET_DTYPE]]()
     offsets.append(0)
@@ -2354,7 +2364,7 @@ def levenshtein_alignment(first: PythonObject, second: PythonObject) raises -> P
     var alphabet = combined_alphabet(left, right)
     var alphabet_size = alphabet.byte_length()
     var substitutions = uniform_matrix(alphabet_size, 0, -1)
-    var scoring = AffineScoring(Int32(-1), Int32(-1))
+    var scoring = AffineGapCosts(Int32(-1), Int32(-1))
     var encoded_left = translate(left, alphabet)
     var encoded_right = translate(right, alphabet)
     var result = serial_align[AlignmentMode.GLOBAL](
@@ -2522,7 +2532,7 @@ def device_local_extremum[
     second_to: Int,
     substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
     alphabet_size: Int,
-    scoring: AffineScoring,
+    scoring: AffineGapCosts,
 ) raises -> Tuple[Int, Int, Int32]:
     """Runs one local sweep on the device and reads back where its maximum sits."""
     var sequences_buffer = upload(ctx, sequences)
@@ -2540,8 +2550,8 @@ def device_local_extremum[
         Int32(rows),
         Int32(rows + second_to),
         Int32(alphabet_size),
-        scoring.gap_opening,
-        scoring.gap_extension,
+        scoring.open,
+        scoring.extend,
         grid_dim=1,
         block_dim=THREADS_PER_BLOCK,
     )
@@ -2814,9 +2824,9 @@ def main() raises:
     var arguments = argv()
     var count = len(arguments)
     if count < 3 or String(arguments[1]) == "--help" or String(arguments[1]) == "-h":
-        print("Usage: affinegaps FIRST SECOND [--local] [--linear] [--gpu]")
+        print("Usage: affinegaps FIRST SECOND [--local] [--gpu]")
         print("                  [--match N] [--mismatch N]")
-        print("                  [--gap-opening N] [--gap-extension N]")
+        print("                  [--open N] [--extend N] [--help]")
         print()
         print("Gotoh affine-gap alignment. Reconstructs the alignment, not just the score.")
         return
@@ -2824,7 +2834,6 @@ def main() raises:
     var first = String(arguments[1])
     var second = String(arguments[2])
     var local = False
-    var linear = False
     var opening = Int(DEFAULT_GAP_OPENING)
     var extension = Int(DEFAULT_GAP_EXTENSION)
     var match_score = Optional[Int]()
@@ -2836,14 +2845,12 @@ def main() raises:
         if flag == "--local":
             local = True
             index += 1
-        elif flag == "--linear":
-            linear = True
             index += 1
         elif index + 1 < count:
             var value = parse_int(String(arguments[index + 1]))
-            if flag == "--gap-opening":
+            if flag == "--open":
                 opening = value.or_else(opening)
-            elif flag == "--gap-extension":
+            elif flag == "--extend":
                 extension = value.or_else(extension)
             elif flag == "--match":
                 match_score = value
@@ -2860,7 +2867,7 @@ def main() raises:
 
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
-    var scoring = AffineScoring(Int32(opening), Int32(extension))
+    var scoring = AffineGapCosts(Int32(opening), Int32(extension))
     var substitutions = default_proteins_matrix() if not match_score else uniform_matrix(
         alphabet_size, match_score.value(), mismatch_score.value()
     )
@@ -2868,20 +2875,7 @@ def main() raises:
     var right = translate(second, alphabet)
 
     var result: AlignmentResult
-    if linear:
-        var path_columns = List[Int32](length=len(left) + 1, fill=Int32(0))
-        var path_entries = List[Layer](length=len(left) + 1, fill=Layer.ALIGNING)
-        var ctx = DeviceContext()
-        hirschberg_path_gpu(
-            ctx, left, right, 0, len(left), 0, len(right),
-            substitutions, alphabet_size, scoring, DEFAULT_TILE_CELLS, path_columns, path_entries,
-        )
-        var expanded = expand_path(left, right, path_columns, path_entries, alphabet, AlignmentMode.GLOBAL, 0, len(left))
-        var score = score_path(
-            left, right, path_columns, path_entries, substitutions, alphabet_size, scoring, len(left)
-        )
-        result = AlignmentResult(score, expanded[0], expanded[1])
-    elif local:
+    if local:
         result = serial_align[AlignmentMode.LOCAL](
             left, right, substitutions, alphabet_size, scoring, alphabet
         )

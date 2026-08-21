@@ -138,7 +138,7 @@ def available(backend: str = "mojo", device: str = "cpu") -> bool:
     This executes a tiny alignment rather than inferring from an import, because a built extension
     on a machine with an unsupported driver imports cleanly and then fails at every device call.
     """
-    if backend == "numpy":
+    if backend == "python":
         return device == "cpu"
     if backend == "numba":
         return device == "cpu" and HAS_NUMBA
@@ -156,6 +156,17 @@ def _kernel(function, backend):
     return function if backend == "numba" else getattr(function, "py_func", function)
 
 
+def _resolve_for(substitution, backend, device):
+    """Resolves the backend for a call, knowing what the caller wants scored.
+
+    An unnamed backend adapts, and a table the compiled kernels do not carry is a reason to
+    adapt away from them. A named backend is still honoured or refused, never quietly swapped.
+    """
+    if backend is None and _custom_scoring(substitution):
+        backend = "numba" if HAS_NUMBA else "python"
+    return _resolve(backend, device)
+
+
 def _resolve(backend, device):
     """Validates a backend and device pair, filling in whichever the caller left unspecified.
 
@@ -166,15 +177,15 @@ def _resolve(backend, device):
         for candidate in (("mojo", "gpu"), ("mojo", "cpu"), ("numba", "cpu")):
             if available(*candidate):
                 return candidate
-        return ("numpy", "cpu")
+        return ("python", "cpu")
     if backend is None:
         backend = "mojo"
         if device == "cpu" and not available("mojo", "cpu"):
-            backend = "numba" if HAS_NUMBA else "numpy"
+            backend = "numba" if HAS_NUMBA else "python"
     if device is None:
         device = "gpu" if backend == "mojo" and available("mojo", "gpu") else "cpu"
 
-    if backend in ("numpy", "numba"):
+    if backend in ("python", "numba"):
         if device != "cpu":
             raise ValueError(f"The {backend} backend runs on the CPU only")
         if backend == "numba" and not HAS_NUMBA:
@@ -226,7 +237,7 @@ def _compiled_batch(algorithm, backend, device, firsts, seconds, options):
 
 def _batch(algorithm, backend, device, firsts, seconds, **options):
     """One batch entry point, on whichever backend resolves."""
-    backend, device = _resolve(backend, device)
+    backend, device = _resolve_for(options.get("substitution"), backend, device)
     if device == "cpu":
         single = _ALGORITHMS[algorithm].reference
         return [single(a, b, backend=backend, device=device, **options) for a, b in zip(firsts, seconds, strict=True)]
@@ -349,8 +360,8 @@ def _reconstruct_alignment(
     inserts: np.ndarray,
     seq1: np.ndarray,
     seq2: np.ndarray,
-    gap_opening: int,
-    gap_extension: int,
+    open: int,
+    extend: int,
     code_to_char: Callable,
     should_continue: Callable,
     flush_prefixes: bool = True,
@@ -371,13 +382,13 @@ def _reconstruct_alignment(
         if state == DELETE:
             align1 += code_to_char(seq1[i - 1])
             align2 += "-"
-            extends = deletes[i - 1, j] + gap_extension > scores[i - 1, j] + gap_opening
+            extends = deletes[i - 1, j] + extend > scores[i - 1, j] + open
             i -= 1
             state = DELETE if extends else MATCH
         elif state == INSERT:
             align1 += "-"
             align2 += code_to_char(seq2[j - 1])
-            extends = inserts[i, j - 1] + gap_extension > scores[i, j - 1] + gap_opening
+            extends = inserts[i, j - 1] + extend > scores[i, j - 1] + open
             j -= 1
             state = INSERT if extends else MATCH
         elif changes[i, j] == DELETE:
@@ -529,8 +540,8 @@ def _needleman_wunsch_gotoh_kernel(
     seq1: np.ndarray,
     seq2: np.ndarray,
     substitution_matrix: np.ndarray,
-    gap_opening: int,
-    gap_extension: int,
+    open: int,
+    extend: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Aligns two sequences using Gotoh's affine gap penalty extensions for the
@@ -547,8 +558,8 @@ def _needleman_wunsch_gotoh_kernel(
     seq1 (np.ndarray): The first sequence to be aligned.
     seq2 (np.ndarray): The second sequence to be aligned.
     substitution_matrix (np.ndarray): A substitution matrix for scoring matches/mismatches.
-    gap_opening (int): The penalty for opening a gap.
-    gap_extension (int): The penalty for extending a gap.
+    open (int): The penalty for opening a gap.
+    extend (int): The penalty for extending a gap.
 
     Returns:
     Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The matrices the traceback needs:
@@ -561,22 +572,22 @@ def _needleman_wunsch_gotoh_kernel(
     >>> seq1 = np.array([1, 2, 3])  # Example sequence
     >>> seq2 = np.array([3, 2, 1])  # Example sequence
     >>> substitution_matrix = np.array([[...], [...], [...]])  # Example substitution matrix
-    >>> gap_opening = 5
-    >>> gap_extension = 2
+    >>> open = 5
+    >>> extend = 2
     >>> scores, changes, deletes, inserts = _needleman_wunsch_gotoh_kernel(seq1, seq2, matrix, opening, extension)
     >>> print("Optimal alignment score matrix:\n", scores)
 
     Notes:
     The basis and recurrence relations for the matrices are as follows:
     Basis:
-    - scores[i, 0] = gap_opening + (i - 1) * gap_extension
-    - scores[0, j] = gap_opening + (j - 1) * gap_extension
-    - deletes[i, 0] = gap_opening + (i - 1) * gap_extension
-    - inserts[0, j] = gap_opening + (j - 1) * gap_extension
+    - scores[i, 0] = open + (i - 1) * extend
+    - scores[0, j] = open + (j - 1) * extend
+    - deletes[i, 0] = open + (i - 1) * extend
+    - inserts[0, j] = open + (j - 1) * extend
 
     Recurrence:
-    - deletes[i, j] = max(scores[i - 1, j] + gap_opening, deletes[i - 1, j] + gap_extension)
-    - inserts[i, j] = max(scores[i, j - 1] + gap_opening, inserts[i, j - 1] + gap_extension)
+    - deletes[i, j] = max(scores[i - 1, j] + open, deletes[i - 1, j] + extend)
+    - inserts[i, j] = max(scores[i, j - 1] + open, inserts[i, j - 1] + extend)
     - match = scores[i - 1, j - 1] + substitution_matrix[(seq1[i - 1], seq2[j - 1])]
     - scores[i, j] = max(match, deletes[i, j], inserts[i, j])
     """
@@ -609,25 +620,25 @@ def _needleman_wunsch_gotoh_kernel(
     # in the "scores", and they are not considered as starting points in each iteration.
     scores[0, 0] = 0
     for j in range(1, seq2_len + 1):
-        scores[0, j] = gap_opening + (j - 1) * gap_extension
-        deletes[0, j] = scores[0, j] + gap_opening + gap_extension
+        scores[0, j] = open + (j - 1) * extend
+        deletes[0, j] = scores[0, j] + open + extend
         changes[0, j] = INSERT
 
     # Fill the scoring matrix
     for i in range(1, seq1_len + 1):
-        scores[i, 0] = gap_opening + (i - 1) * gap_extension
-        inserts[i, 0] = scores[i, 0] + gap_opening + gap_extension
+        scores[i, 0] = open + (i - 1) * extend
+        inserts[i, 0] = scores[i, 0] + open + extend
         changes[i, 0] = DELETE
 
         for j in range(1, seq2_len + 1):
             substitution = substitution_matrix[seq1[i - 1], seq2[j - 1]]
             delete = max(
-                scores[i - 1, j] + gap_opening,
-                deletes[i - 1, j] + gap_extension,
+                scores[i - 1, j] + open,
+                deletes[i - 1, j] + extend,
             )
             insert = max(
-                scores[i, j - 1] + gap_opening,
-                inserts[i, j - 1] + gap_extension,
+                scores[i, j - 1] + open,
+                inserts[i, j - 1] + extend,
             )
             replace = scores[i - 1, j - 1] + substitution
             score = max(replace, delete, insert)
@@ -652,7 +663,7 @@ def needleman_wunsch_gotoh_alignment(
     *,
     substitution: SubstitutionCosts | None = None,
     gaps: AffineGapCosts | None = None,
-    backend: Literal["numpy", "numba", "mojo"] | None = None,
+    backend: Literal["python", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> tuple[str, str, int]:
     """
@@ -682,7 +693,7 @@ def needleman_wunsch_gotoh_alignment(
     >>> print("Alignment 2:", align2)
     >>> print("Score:", score)
     """
-    backend, device = _resolve(backend, device)
+    backend, device = _resolve_for(substitution, backend, device)
     if backend == "mojo":
         return _compiled_call(
             Algorithm.GLOBAL_ALIGNMENT,
@@ -693,9 +704,7 @@ def needleman_wunsch_gotoh_alignment(
             dict(substitution=substitution, gaps=gaps),
         )
 
-    substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
-        substitution, gaps
-    )
+    substitution_alphabet, substitution_matrix, open, extend = _validate_gotoh_arguments(substitution, gaps)
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
@@ -703,8 +712,8 @@ def needleman_wunsch_gotoh_alignment(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
-        gap_opening=gap_opening,
-        gap_extension=gap_extension,
+        open=open,
+        extend=extend,
     )
 
     align1, align2 = _reconstruct_alignment(
@@ -714,8 +723,8 @@ def needleman_wunsch_gotoh_alignment(
         inserts,
         seq1,
         seq2,
-        gap_opening,
-        gap_extension,
+        open,
+        extend,
         lambda x: substitution_alphabet[x],
         lambda i, j: i > 0 and j > 0,
     )
@@ -727,8 +736,8 @@ def _needleman_wunsch_gotoh_score_kernel(
     seq1: np.ndarray,
     seq2: np.ndarray,
     substitution_matrix: np.ndarray,
-    gap_opening: int,
-    gap_extension: int,
+    open: int,
+    extend: int,
 ) -> int:
     """
     Measures the alignment score of two sequences using Gotoh's affine gap penalty extensions for the
@@ -744,8 +753,8 @@ def _needleman_wunsch_gotoh_score_kernel(
     seq1 (np.ndarray): The first sequence to be aligned.
     seq2 (np.ndarray): The second sequence to be aligned.
     substitution_matrix (np.ndarray): The substitution matrix for scoring matches/mismatches.
-    gap_opening (int): The penalty for opening a gap.
-    gap_extension (int): The penalty for extending a gap.
+    open (int): The penalty for opening a gap.
+    extend (int): The penalty for extending a gap.
 
     Returns:
     int: The alignment score.
@@ -767,17 +776,17 @@ def _needleman_wunsch_gotoh_score_kernel(
     # in the "scores", and they are not considered as starting points in each iteration.
     old_scores[0] = 0
     for j in range(1, seq2_len + 1):
-        old_scores[j] = gap_opening + (j - 1) * gap_extension
-        old_deletes[j] = old_scores[j] + gap_opening + gap_extension
+        old_scores[j] = open + (j - 1) * extend
+        old_deletes[j] = old_scores[j] + open + extend
 
     for i in range(1, seq1_len + 1):
-        new_scores[0] = gap_opening + (i - 1) * gap_extension
-        new_inserts[0] = new_scores[0] + gap_opening + gap_extension
+        new_scores[0] = open + (i - 1) * extend
+        new_inserts[0] = new_scores[0] + open + extend
 
         for j in range(1, seq2_len + 1):
             substitution = substitution_matrix[seq1[i - 1], seq2[j - 1]]
-            delete = max(old_scores[j] + gap_opening, old_deletes[j] + gap_extension)
-            insert = max(new_scores[j - 1] + gap_opening, new_inserts[j - 1] + gap_extension)
+            delete = max(old_scores[j] + open, old_deletes[j] + extend)
+            insert = max(new_scores[j - 1] + open, new_inserts[j - 1] + extend)
             replace = old_scores[j - 1] + substitution
             score = max(replace, delete, insert)
             new_scores[j] = score
@@ -798,7 +807,7 @@ def needleman_wunsch_gotoh_score(
     *,
     substitution: SubstitutionCosts | None = None,
     gaps: AffineGapCosts | None = None,
-    backend: Literal["numpy", "numba", "mojo"] | None = None,
+    backend: Literal["python", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> int:
     """
@@ -828,7 +837,7 @@ def needleman_wunsch_gotoh_score(
     >>> print("Alignment 2:", align2)
     >>> print("Score:", score)
     """
-    backend, device = _resolve(backend, device)
+    backend, device = _resolve_for(substitution, backend, device)
     if backend == "mojo":
         return _compiled_call(
             Algorithm.GLOBAL_SCORE,
@@ -846,9 +855,7 @@ def needleman_wunsch_gotoh_score(
     # if (substitution_matrix == substitution_matrix.T).all():
     #     if len(str1) > len(str2):
     #         str1, str2 = str2, str1
-    substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
-        substitution, gaps
-    )
+    substitution_alphabet, substitution_matrix, open, extend = _validate_gotoh_arguments(substitution, gaps)
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
@@ -857,8 +864,8 @@ def needleman_wunsch_gotoh_score(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
-        gap_opening=gap_opening,
-        gap_extension=gap_extension,
+        open=open,
+        extend=extend,
     )
 
     return int(score)
@@ -869,8 +876,8 @@ def _smith_waterman_gotoh_kernel(
     seq1: np.ndarray,
     seq2: np.ndarray,
     substitution_matrix: np.ndarray,
-    gap_opening: int,
-    gap_extension: int,
+    open: int,
+    extend: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
     """
     Aligns two sequences using Gotoh's affine gap penalty extensions for the
@@ -887,8 +894,8 @@ def _smith_waterman_gotoh_kernel(
     seq1 (np.ndarray): The first sequence to be aligned.
     seq2 (np.ndarray): The second sequence to be aligned.
     substitution_matrix (np.ndarray): A substitution matrix for scoring matches/mismatches.
-    gap_opening (int): The penalty for opening a gap.
-    gap_extension (int): The penalty for extending a gap.
+    open (int): The penalty for opening a gap.
+    extend (int): The penalty for extending a gap.
 
     Returns:
     Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]: What the traceback needs:
@@ -902,22 +909,22 @@ def _smith_waterman_gotoh_kernel(
     >>> seq1 = np.array([1, 2, 3])  # Example sequence
     >>> seq2 = np.array([3, 2, 1])  # Example sequence
     >>> substitution_matrix = np.array([[...], [...], [...]])  # Example substitution matrix
-    >>> gap_opening = 5
-    >>> gap_extension = 2
+    >>> open = 5
+    >>> extend = 2
     >>> scores, changes, deletes, inserts, best = _smith_waterman_gotoh_kernel(seq1, seq2, matrix, opening, extension)
     >>> print("Optimal alignment score matrix:\n", scores)
 
     Notes:
     The basis and recurrence relations for the matrices are as follows:
     Basis:
-    - scores[i, 0] = gap_opening + (i - 1) * gap_extension
-    - scores[0, j] = gap_opening + (j - 1) * gap_extension
-    - deletes[i, 0] = gap_opening + (i - 1) * gap_extension
-    - inserts[0, j] = gap_opening + (j - 1) * gap_extension
+    - scores[i, 0] = open + (i - 1) * extend
+    - scores[0, j] = open + (j - 1) * extend
+    - deletes[i, 0] = open + (i - 1) * extend
+    - inserts[0, j] = open + (j - 1) * extend
 
     Recurrence:
-    - deletes[i, j] = max(scores[i - 1, j] + gap_opening, deletes[i - 1, j] + gap_extension)
-    - inserts[i, j] = max(scores[i, j - 1] + gap_opening, inserts[i, j - 1] + gap_extension)
+    - deletes[i, j] = max(scores[i - 1, j] + open, deletes[i - 1, j] + extend)
+    - inserts[i, j] = max(scores[i, j - 1] + open, inserts[i, j - 1] + extend)
     - match = scores[i - 1, j - 1] + substitution_matrix[(seq1[i - 1], seq2[j - 1])]
     - scores[i, j] = max(match, deletes[i, j], inserts[i, j], 0)
     """
@@ -949,7 +956,7 @@ def _smith_waterman_gotoh_kernel(
     # so that the values in header (left or top) "gaps" are always smaller than those
     # in the "scores", and they are not considered as starting points in each iteration.
     scores[0, :] = 0
-    deletes[0, :] = gap_opening + gap_extension
+    deletes[0, :] = open + extend
     changes[0, :] = INSERT
 
     # Unlike Needleman-Wunsch, we also track the position of the maximum score.
@@ -959,18 +966,18 @@ def _smith_waterman_gotoh_kernel(
     # Fill the scoring matrix
     for i in range(1, seq1_len + 1):
         scores[i, 0] = 0
-        inserts[i, 0] = gap_opening + gap_extension
+        inserts[i, 0] = open + extend
         changes[i, 0] = DELETE
 
         for j in range(1, seq2_len + 1):
             substitution = substitution_matrix[seq1[i - 1], seq2[j - 1]]
             delete = max(
-                scores[i - 1, j] + gap_opening,
-                deletes[i - 1, j] + gap_extension,
+                scores[i - 1, j] + open,
+                deletes[i - 1, j] + extend,
             )
             insert = max(
-                scores[i, j - 1] + gap_opening,
-                inserts[i, j - 1] + gap_extension,
+                scores[i, j - 1] + open,
+                inserts[i, j - 1] + extend,
             )
             replace = scores[i - 1, j - 1] + substitution
             score = max(replace, delete, insert, 0)
@@ -1000,7 +1007,7 @@ def smith_waterman_gotoh_alignment(
     *,
     substitution: SubstitutionCosts | None = None,
     gaps: AffineGapCosts | None = None,
-    backend: Literal["numpy", "numba", "mojo"] | None = None,
+    backend: Literal["python", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> tuple[str, str, int]:
     """
@@ -1016,7 +1023,7 @@ def smith_waterman_gotoh_alignment(
     Returns:
     Tuple[str, str, int]: The optimal local alignment of the two sequences and the alignment score.
     """
-    backend, device = _resolve(backend, device)
+    backend, device = _resolve_for(substitution, backend, device)
     if backend == "mojo":
         return _compiled_call(
             Algorithm.LOCAL_ALIGNMENT,
@@ -1027,9 +1034,7 @@ def smith_waterman_gotoh_alignment(
             dict(substitution=substitution, gaps=gaps),
         )
 
-    substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
-        substitution, gaps
-    )
+    substitution_alphabet, substitution_matrix, open, extend = _validate_gotoh_arguments(substitution, gaps)
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
@@ -1037,8 +1042,8 @@ def smith_waterman_gotoh_alignment(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
-        gap_opening=gap_opening,
-        gap_extension=gap_extension,
+        open=open,
+        extend=extend,
     )
 
     prefix1, prefix2 = max_pos
@@ -1049,8 +1054,8 @@ def smith_waterman_gotoh_alignment(
         inserts,
         seq1[:prefix1],
         seq2[:prefix2],
-        gap_opening,
-        gap_extension,
+        open,
+        extend,
         lambda x: substitution_alphabet[x],
         lambda i, j: i > 0 and j > 0 and scores[i, j] > 0,
         flush_prefixes=False,
@@ -1063,8 +1068,8 @@ def _smith_waterman_gotoh_score_kernel(
     seq1: np.ndarray,
     seq2: np.ndarray,
     substitution_matrix: np.ndarray,
-    gap_opening: int,
-    gap_extension: int,
+    open: int,
+    extend: int,
 ) -> int:
     """
     Computes the Smith-Waterman alignment score using Gotoh's affine gap penalty extensions.
@@ -1074,8 +1079,8 @@ def _smith_waterman_gotoh_score_kernel(
     seq1 (np.ndarray): The first sequence to be aligned.
     seq2 (np.ndarray): The second sequence to be aligned.
     substitution_matrix (np.ndarray): The substitution matrix for scoring matches/mismatches.
-    gap_opening (int): The penalty for opening a gap.
-    gap_extension (int): The penalty for extending a gap.
+    open (int): The penalty for opening a gap.
+    extend (int): The penalty for extending a gap.
 
     Returns:
     int: The highest alignment score.
@@ -1097,18 +1102,18 @@ def _smith_waterman_gotoh_score_kernel(
     old_scores[0] = 0
     for j in range(1, seq2_len + 1):
         old_scores[j] = 0
-        old_deletes[j] = gap_opening + gap_extension
+        old_deletes[j] = open + extend
 
     max_score = 0
 
     for i in range(1, seq1_len + 1):
         new_scores[0] = 0
-        new_inserts[0] = gap_opening + gap_extension
+        new_inserts[0] = open + extend
 
         for j in range(1, seq2_len + 1):
             substitution = substitution_matrix[seq1[i - 1], seq2[j - 1]]
-            delete = max(old_scores[j] + gap_opening, old_deletes[j] + gap_extension)
-            insert = max(new_scores[j - 1] + gap_opening, new_inserts[j - 1] + gap_extension)
+            delete = max(old_scores[j] + open, old_deletes[j] + extend)
+            insert = max(new_scores[j - 1] + open, new_inserts[j - 1] + extend)
             replace = old_scores[j - 1] + substitution
             score = max(replace, delete, insert, 0)
             new_scores[j] = score
@@ -1132,7 +1137,7 @@ def smith_waterman_gotoh_score(
     *,
     substitution: SubstitutionCosts | None = None,
     gaps: AffineGapCosts | None = None,
-    backend: Literal["numpy", "numba", "mojo"] | None = None,
+    backend: Literal["python", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> int:
     """
@@ -1155,7 +1160,7 @@ def smith_waterman_gotoh_score(
     >>> score = smith_waterman_gotoh_score(str1, str2)
     >>> print("Score:", score)
     """
-    backend, device = _resolve(backend, device)
+    backend, device = _resolve_for(substitution, backend, device)
     if backend == "mojo":
         return _compiled_call(
             Algorithm.LOCAL_SCORE,
@@ -1166,9 +1171,7 @@ def smith_waterman_gotoh_score(
             dict(substitution=substitution, gaps=gaps),
         )
 
-    substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
-        substitution, gaps
-    )
+    substitution_alphabet, substitution_matrix, open, extend = _validate_gotoh_arguments(substitution, gaps)
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
@@ -1177,8 +1180,8 @@ def smith_waterman_gotoh_score(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
-        gap_opening=gap_opening,
-        gap_extension=gap_extension,
+        open=open,
+        extend=extend,
     )
 
     return int(score)
@@ -1270,13 +1273,13 @@ def main():
         help="The score for a mismatch, to compose the substitution matrix; uses scaled BLOSUM62 by default",
     )
     parser.add_argument(
-        "--gap-opening",
+        "--open",
         type=int,
         default=None,
         help=f"The penalty for opening a gap; uses {AffineGapCosts().open} by default",
     )
     parser.add_argument(
-        "--gap-extension",
+        "--extend",
         type=int,
         default=None,
         help=f"The penalty for extending a gap; uses {AffineGapCosts().extend} by default",
@@ -1303,8 +1306,8 @@ def main():
             substitution = UniformSubstitutionCosts(match=args.match, mismatch=args.mismatch)
         defaults = AffineGapCosts()
         gaps = AffineGapCosts(
-            open=defaults.open if args.gap_opening is None else args.gap_opening,
-            extend=defaults.extend if args.gap_extension is None else args.gap_extension,
+            open=defaults.open if args.open is None else args.open,
+            extend=defaults.extend if args.extend is None else args.extend,
         )
         align1, align2, score = aligner(args.seq1, args.seq2, substitution=substitution, gaps=gaps, **placement)
     except Exception as exc:

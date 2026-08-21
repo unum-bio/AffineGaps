@@ -110,7 +110,7 @@ def rescore(first: str, second: str, scoring: dict | None = None) -> int:
 # Keyed by both axes. Naming a key just "gpu" would be ambiguous the moment a second backend grows
 # a device path, and Numba already has one in `numba.cuda`.
 ALL_BACKENDS = {
-    "numpy-cpu": ("numpy", "cpu"),
+    "python-cpu": ("python", "cpu"),
     "numba-cpu": ("numba", "cpu"),
     "mojo-cpu": ("mojo", "cpu"),
     "mojo-gpu": ("mojo", "gpu"),
@@ -137,7 +137,7 @@ def pytest_generate_tests(metafunc):
     """Supplies the backend axis to any test that names it."""
     for argument, choices in (
         ("backend", requested_backends()),
-        ("compiled_backend", [n for n in requested_backends() if not n.startswith("numpy")]),
+        ("compiled_backend", [n for n in requested_backends() if not n.startswith("python")]),
     ):
         if argument in metafunc.fixturenames:
             metafunc.parametrize(argument, choices, indirect=True)
@@ -366,7 +366,7 @@ def test_matches_reference(compiled_backend, mode: str):
     """A compiled backend must return exactly what the reference returns, strings included."""
     first, second = random_pair()
     assert aligner_for(mode)(first, second, **SCORING, **compiled_backend) == aligner_for(mode)(
-        first, second, **SCORING, backend="numpy"
+        first, second, **SCORING, backend="python"
     )
 
 
@@ -405,14 +405,14 @@ def test_batch_matches_single_pair(mode: str):
     firsts, seconds = [a for a, _ in pairs], [b for _, b in pairs]
     batched = getattr(affinegaps, f"{'needleman_wunsch' if mode == 'global' else 'smith_waterman'}_gotoh_alignments")
     produced = batched(firsts, seconds, **SCORING)
-    expected = [aligner_for(mode)(a, b, **SCORING, backend="numpy") for a, b in pairs]
+    expected = [aligner_for(mode)(a, b, **SCORING, backend="python") for a, b in pairs]
     assert produced == expected
 
 
 def test_rejects_what_it_cannot_do():
     """The dispatcher must refuse rather than quietly doing something else."""
     with pytest.raises(ValueError):
-        needleman_wunsch_gotoh_score("AR", "RA", backend="numpy", device="gpu")
+        needleman_wunsch_gotoh_score("AR", "RA", backend="python", device="gpu")
     with pytest.raises(ValueError):
         needleman_wunsch_gotoh_score("AR", "RA", backend="CPU")
     if affinegaps.available("mojo", "cpu"):
