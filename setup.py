@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="affinegaps",
-    version="0.2.4",
+    version="0.2.5",
     author="Ash Vardanian",
     author_email="1983160+ashvardanian@users.noreply.github.com",
     description="JIT-compiled string edit-distances including Needleman-Wunsch, Smith-Waterman, Wagner-Fisher, and Gotoh algorithms",
