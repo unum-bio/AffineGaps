@@ -29,7 +29,7 @@ pixi run test       # the differential suite against affinegaps.py
 ```
 """
 
-from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.memory import stack_allocation
 from std.memory.pointer import AddressSpace
 from std.os import abort
@@ -1707,32 +1707,7 @@ def hirschberg_path_gpu(
     for index in range(columns):
         sequences.append(second[index])
 
-    # Every sweep of a level claims its own slice, and a deep level is many tiny sweeps, so each
-    # array carries the whole level: the real extent plus a constant per sweep, and a level never
-    # holds more than two sweeps per row.
-    var frontier_span = columns + 4 * rows + 32
-    var left_span = 5 * rows + 32
-    var tile_rows_count = (rows + TILE_SIDE - 1) // TILE_SIDE + 2
-    var tile_columns_count = (columns + TILE_SIDE - 1) // TILE_SIDE + 2
-    var corner_span = tile_rows_count * tile_columns_count + 6 * rows + 32
-    var buffers = SweepBuffers(
-        ctx.enqueue_create_buffer[SYMBOL_DTYPE](max(rows + columns, 1)),
-        ctx.enqueue_create_buffer[SUBSTITUTION_DTYPE](len(substitutions)),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](4 * max(rows, 1)),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](left_span),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](left_span),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](corner_span),
-        corner_span,
-        left_span,
-        frontier_span,
-    )
-
-    ctx.enqueue_copy(buffers.sequences, Span(sequences))
-    ctx.enqueue_copy(buffers.substitutions, Span(substitutions))
+    var buffers = sweep_buffers(ctx, rows, columns, Span(sequences), substitutions)
 
     var frames = List[Frame]()
     frames.append(
@@ -1779,14 +1754,14 @@ def hirschberg_path_gpu(
                 Sweep(
                     split - frame.first_from, width, frame.first_from,
                     rows + frame.second_from, frame.first_from, frame.second_from,
-                    frame.top, SweepHalf.FORWARD,
+                    frame.top, SweepHalf.FORWARD, False,
                 )
             )
             sweeps.append(
                 Sweep(
                     frame.first_to - split, width, split,
                     rows + frame.second_from, split, frame.second_from,
-                    frame.bottom, SweepHalf.REVERSE,
+                    frame.bottom, SweepHalf.REVERSE, False,
                 )
             )
             joins[index * 3 + 2] = Scalar[SCORE_DTYPE](width)
@@ -1940,14 +1915,16 @@ comptime DEFAULT_TILE_CELLS = 4096
 comptime TILE_SIDE = 256
 
 # rows, columns, first_from, second_from, row_base, column_base, corner_base, entry, half,
-# tile_rows_count, tile_columns_count
-comptime SWEEP_PLAN_FIELDS = 11
+# tile_rows_count, tile_columns_count, local
+comptime SWEEP_PLAN_FIELDS = 12
 
 
 def tiled_sweep_kernel(
     sequences: Pointer[Scalar[SYMBOL_DTYPE], MutAnyOrigin],
     substitutions: Pointer[Scalar[SUBSTITUTION_DTYPE], MutAnyOrigin],
     plans: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
+    block_best: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
+    block_place: Pointer[Scalar[DType.int64], MutAnyOrigin],
     forward_scores: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
     forward_deletes: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
     reverse_scores: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
@@ -1978,7 +1955,9 @@ def tiled_sweep_kernel(
     var reversed_order = Int(plans[unsafe_offset=plan + 8]) != 0
     var tile_rows_count = Int(plans[unsafe_offset=plan + 9])
     var tile_columns_count = Int(plans[unsafe_offset=plan + 10])
+    var local = Int(plans[unsafe_offset=plan + 11]) != 0
     var corner_stride = tile_columns_count + 1
+    var slot = Int(block_idx.y) * Int(grid_dim.x) + Int(block_idx.x)
 
     var tile_row_low = Int(tile_diagonal) - min(Int(tile_diagonal), tile_columns_count - 1)
     var tile_row_high = min(Int(tile_diagonal), tile_rows_count - 1)
@@ -1993,6 +1972,8 @@ def tiled_sweep_kernel(
     if height <= 0 or width_span <= 0:
         return
 
+    var best_cell = Int32(0)
+    var best_at = Int64(0)
     var top_scores = reverse_scores if reversed_order else forward_scores
     var top_deletes = reverse_deletes if reversed_order else forward_deletes
     var width = Int(alphabet_size)
@@ -2029,7 +2010,13 @@ def tiled_sweep_kernel(
             if local_row == 0 or local_column == 0:
                 # A tile edge. Outside the matrix it is the affine ramp; inside it is whatever the
                 # neighbouring tile left behind.
-                if row == 0 and column == 0:
+                if local and (row == 0 or column == 0):
+                    # A local sweep starts afresh on the matrix border only. An interior tile
+                    # edge still carries its neighbour's frontier.
+                    cell = 0
+                    deletion = open + extend
+                    insertion = deletion
+                elif row == 0 and column == 0:
                     cell = 0
                     deletion = open + extend
                     insertion = deletion
@@ -2076,6 +2063,11 @@ def tiled_sweep_kernel(
                 cell = computed.score
                 deletion = computed.deletion
                 insertion = computed.insertion
+                if local and cell < 0:
+                    cell = 0
+                if local and cell > best_cell:
+                    best_cell = cell
+                    best_at = Int64(row) * Int64(columns + 1) + Int64(column)
 
             wavefront.scores_current[unsafe_offset=local_row] = cell
             wavefront.deletes_current[unsafe_offset=local_row] = deletion
@@ -2101,6 +2093,26 @@ def tiled_sweep_kernel(
 
         wavefront.rotate()
 
+    # A local sweep reports the best cell this block saw, for the host to reduce across blocks.
+    if local:
+        var best_scores = stack_allocation[
+            THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED
+        ]()
+        var best_places = stack_allocation[
+            THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED
+        ]()
+        block_argmax(best_scores, best_places, best_cell, best_at)
+        if thread_idx.x == 0:
+            # One launch per tile-anti-diagonal, so this slot accumulates rather than replaces.
+            var winner = best_scores[unsafe_offset=0]
+            var where = best_places[unsafe_offset=0]
+            var held = block_best[unsafe_offset=slot]
+            if winner > held or (
+                winner == held and winner != 0 and where < block_place[unsafe_offset=slot]
+            ):
+                block_best[unsafe_offset=slot] = winner
+                block_place[unsafe_offset=slot] = where
+
 
 @fieldwise_init
 struct SweepBuffers(Movable):
@@ -2120,6 +2132,9 @@ struct SweepBuffers(Movable):
     var corner_span: Int
     var left_span: Int
     var frontier_span: Int
+    var block_best: DeviceBuffer[SCORE_DTYPE]
+    var block_place: DeviceBuffer[DType.int64]
+    var block_slots: Int
 
 
 def crossing_kernel(
@@ -2193,6 +2208,7 @@ struct Sweep(ImplicitlyCopyable, TrivialRegisterPassable):
     var column_base: Int
     var entry: GapRun
     var half: SweepHalf
+    var local: Bool
 
     def tile_rows(self) -> Int:
         return max((self.rows + TILE_SIDE - 1) // TILE_SIDE, 1)
@@ -2243,6 +2259,7 @@ def sweep_level(
         plan[base + 8] = Scalar[SCORE_DTYPE](Int(sweep.half == SweepHalf.REVERSE))
         plan[base + 9] = Scalar[SCORE_DTYPE](tile_rows)
         plan[base + 10] = Scalar[SCORE_DTYPE](tile_columns)
+        plan[base + 11] = Scalar[SCORE_DTYPE](Int(sweep.local))
         corner_base += (tile_rows + 1) * (tile_columns + 1)
         sweeps[index].row_base = left_base
         sweeps[index].column_base = top_base
@@ -2252,7 +2269,14 @@ def sweep_level(
         deepest = max(deepest, sweep.tile_diagonals())
 
     if corner_base > buffers.corner_span or left_base > buffers.left_span or top_base > buffers.frontier_span:
-        raise Error("Sweep frontier scratch is too small for this recursion level.")
+        raise Error(
+            String(
+                "Sweep scratch too small: corner ", corner_base, "/", buffers.corner_span,
+                " left ", left_base, "/", buffers.left_span,
+                " top ", top_base, "/", buffers.frontier_span,
+                " over ", len(sweeps), " sweeps",
+            )
+        )
 
     var plan_buffer = upload(ctx, Span(plan))
     for tile_diagonal in range(deepest):
@@ -2260,6 +2284,8 @@ def sweep_level(
             buffers.sequences.unsafe_ptr(),
             buffers.substitutions.unsafe_ptr(),
             plan_buffer.unsafe_ptr(),
+            buffers.block_best.unsafe_ptr(),
+            buffers.block_place.unsafe_ptr(),
             buffers.top_scores.unsafe_ptr(),
             buffers.top_deletes.unsafe_ptr(),
             buffers.reverse_scores.unsafe_ptr(),
@@ -2683,49 +2709,87 @@ def smith_waterman_gotoh_alignment_linear(
     return triple
 
 
+def sweep_buffers(
+    ctx: DeviceContext,
+    rows: Int,
+    columns: Int,
+    sequences: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
+) raises -> SweepBuffers:
+    """Device scratch for one alignment, sized so a whole recursion level fits side by side.
+
+    Every sweep of a level claims its own slice, and a deep level is many tiny sweeps, so each
+    array carries the real extent plus a constant per sweep. A level never holds more than two
+    sweeps per row.
+    """
+    var frontier_span = columns + 4 * rows + 32
+    var left_span = 5 * rows + 32
+    var tile_rows_count = (rows + TILE_SIDE - 1) // TILE_SIDE + 2
+    var tile_columns_count = (columns + TILE_SIDE - 1) // TILE_SIDE + 2
+    var corner_span = tile_rows_count * tile_columns_count + 6 * rows + 32
+    # Only a local scan writes here, and that is one sweep, so the grid is one tile-diagonal wide.
+    var block_slots = tile_rows_count + 4
+    var buffers = SweepBuffers(
+        ctx.enqueue_create_buffer[SYMBOL_DTYPE](max(rows + columns, 1)),
+        ctx.enqueue_create_buffer[SUBSTITUTION_DTYPE](len(substitutions)),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](4 * max(rows, 1)),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](left_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](left_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](corner_span),
+        corner_span,
+        left_span,
+        frontier_span,
+        zeroed[SCORE_DTYPE](ctx, block_slots),
+        zeroed[DType.int64](ctx, block_slots),
+        block_slots,
+    )
+    ctx.enqueue_copy(buffers.sequences, sequences)
+    ctx.enqueue_copy(buffers.substitutions, substitutions)
+    return buffers^
+
+
 def device_local_extremum[
     half: SweepHalf
 ](
     ctx: DeviceContext,
-    sequences: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    mut buffers: SweepBuffers,
     rows: Int,
     first_to: Int,
     second_to: Int,
-    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
 ) raises -> Tuple[Int, Int, Int32]:
-    """Runs one local sweep on the device and reads back where its maximum sits."""
-    var sequences_buffer = upload(ctx, sequences)
-    var substitutions_buffer = upload(ctx, substitutions)
-    var bands_buffer = ctx.enqueue_create_buffer[SCORE_DTYPE](BANDS_PER_SWEEP * (first_to + 1))
-    var outcome_buffer = zeroed[DType.int64](ctx, 3)
+    """Finds where the best local alignment ends, tiled across the device rather than one block.
 
-    ctx.enqueue_function[local_extremum_kernel[half]](
-        sequences_buffer.unsafe_ptr(),
-        substitutions_buffer.unsafe_ptr(),
-        bands_buffer.unsafe_ptr(),
-        outcome_buffer.unsafe_ptr(),
-        Int32(0),
-        Int32(first_to),
-        Int32(rows),
-        Int32(rows + second_to),
-        Int32(alphabet_size),
-        scoring.open,
-        scoring.extend,
-        grid_dim=1,
-        block_dim=THREADS_PER_BLOCK,
+    Local alignment has unknown endpoints, so this runs twice: forwards it says where the best
+    alignment ends, and backwards over those prefixes how far the same alignment reaches back.
+    Ties resolve to the earliest cell in row-major order, matching the reference scan.
+    """
+    var sweeps = List[Sweep]()
+    sweeps.append(
+        Sweep(first_to, second_to, 0, rows, 0, 0, GapRun.OPENS, half, True)
     )
-    ctx.synchronize()
+    # Blocks that fall outside their sweep return without writing, and the buffers outlive the
+    # scan, so anything left from an earlier one would be read as a candidate.
+    ctx.enqueue_memset(buffers.block_best, Scalar[SCORE_DTYPE](0))
+    ctx.enqueue_memset(buffers.block_place, Scalar[DType.int64](0))
+    sweep_level(ctx, buffers, sweeps, alphabet_size, scoring)
 
-    var best_row = 0
-    var best_column = 0
     var best = Int32(0)
-    with outcome_buffer.map_to_host() as host:
-        best_row = Int(host[0])
-        best_column = Int(host[1])
-        best = Int32(Int(host[2]))
-    return (best_row, best_column, best)
+    var best_place = Int64(0)
+    var slots = min(sweeps[0].tile_rows(), sweeps[0].tile_columns())
+    with buffers.block_best.map_to_host() as scores, buffers.block_place.map_to_host() as places:
+        for slot in range(min(slots, buffers.block_slots)):
+            var candidate = scores[slot]
+            if candidate > best or (candidate == best and candidate != 0 and places[slot] < best_place):
+                best = candidate
+                best_place = places[slot]
+    var stride = Int64(second_to + 1)
+    return (Int(best_place // stride), Int(best_place % stride), best)
 
 
 def smith_waterman_gotoh_alignment_linear_gpu(
@@ -2746,15 +2810,9 @@ def smith_waterman_gotoh_alignment_linear_gpu(
     sequences.extend(Span(right))
 
     var ctx = DeviceContext()
+    var buffers = sweep_buffers(ctx, len(left), len(right), Span(sequences), substitutions)
     var last_row, last_column, score = device_local_extremum[SweepHalf.FORWARD](
-        ctx,
-        sequences,
-        len(left),
-        len(left),
-        len(right),
-        substitutions,
-        alphabet_size,
-        scoring,
+        ctx, buffers, len(left), len(left), len(right), alphabet_size, scoring
     )
 
     var path_columns = List[Int32](length=len(left) + 1, fill=Int32(0))
@@ -2763,14 +2821,7 @@ def smith_waterman_gotoh_alignment_linear_gpu(
     var first_row = last_row
     if score > 0:
         var back_rows, back_columns, _ = device_local_extremum[SweepHalf.REVERSE](
-            ctx,
-            sequences,
-            len(left),
-            last_row,
-            last_column,
-            substitutions,
-            alphabet_size,
-            scoring,
+            ctx, buffers, len(left), last_row, last_column, alphabet_size, scoring
         )
         first_row = last_row - back_rows
         var first_column = last_column - back_columns
