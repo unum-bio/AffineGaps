@@ -38,8 +38,10 @@ from std.sys import argv
 from std.python.bindings import PythonModuleBuilder
 from max.gpu import barrier
 from max.gpu.primitives import block
-from max.gpu.host import DeviceBuffer, DeviceContext
-from std.gpu.host.info import H100
+from max.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
+from max.gpu.memory import external_memory
+from std.gpu.host.info import GPUInfo
+from std.sys.info import _accelerator_arch, has_accelerator
 
 # region Scoring
 
@@ -48,6 +50,8 @@ comptime SYMBOL_DTYPE = DType.uint8
 comptime SUBSTITUTION_DTYPE = DType.int8
 comptime CHANGE_DTYPE = DType.uint8
 comptime OFFSET_DTYPE = DType.uint32
+
+comptime ALL_MODES = (AlignmentMode.GLOBAL, AlignmentMode.LOCAL)
 
 comptime DEFAULT_PROTEINS_ALPHABET = "ARNDCQEGHILKMFPSTWYVBZX"
 comptime DEFAULT_GAP_OPENING = Int32(-20)
@@ -75,16 +79,40 @@ comptime BLOCKS_PER_MULTIPROCESSOR = 4
 
 # Bytes a block may hold without opting into the dynamic carve-out.
 comptime STATIC_SHARED_LIMIT = 48 * 1024
-comptime SHARED_PER_BLOCK = min(
-    H100.shared_memory_per_multiprocessor // BLOCKS_PER_MULTIPROCESSOR, STATIC_SHARED_LIMIT
-)
 
-# Seven bands of scores, deletions and insertions, plus the staged table and the reductions.
+
+def target_shared_per_multiprocessor() -> Int:
+    """Shared memory per multiprocessor on whatever this is being compiled for.
+
+    A `comptime if` elides the untaken branch where a ternary would instantiate both, which is
+    what lets the no-accelerator case avoid naming a device at all: it falls back to the static
+    carve-out limit, and nothing sized from it can run on such a host anyway.
+    """
+    comptime if has_accelerator():
+        return GPUInfo.from_name[_accelerator_arch()]().shared_memory_per_multiprocessor
+    return BLOCKS_PER_MULTIPROCESSOR * STATIC_SHARED_LIMIT
+
+
+comptime SHARED_PER_BLOCK = min(target_shared_per_multiprocessor() // BLOCKS_PER_MULTIPROCESSOR, STATIC_SHARED_LIMIT)
+
+# Seven bands of scores, deletions and insertions. The staged table and the reductions stay in
+# static shared memory; only the bands are carved out dynamically, so their length follows the
+# batch rather than a constant.
 comptime BANDS_PER_SWEEP = 7
 comptime REDUCTION_BYTES = THREADS_PER_BLOCK * 12
-comptime MAX_BAND_LENGTH = (
-    SHARED_PER_BLOCK - MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE - REDUCTION_BYTES
-) // (BANDS_PER_SWEEP * 4) - 1
+comptime STATIC_SHARED_USED = MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE + REDUCTION_BYTES
+
+# A block may opt into all of a multiprocessor's shared memory but the kilobyte the driver keeps.
+# Measured on this target: 227 kibibytes of dynamic shared memory launches, 228 does not.
+comptime SHARED_RESERVED = 1024
+comptime MAX_DYNAMIC_SHARED = target_shared_per_multiprocessor() - SHARED_RESERVED
+comptime MAX_BAND_LENGTH = (MAX_DYNAMIC_SHARED - STATIC_SHARED_USED) // (BANDS_PER_SWEEP * 4) - 1
+
+
+def band_bytes(band_stride: Int) -> Int:
+    """Dynamic shared memory one block needs to hold its seven bands."""
+    return BANDS_PER_SWEEP * band_stride * 4
+
 
 # A quarter of the range: far below any reachable score, which a path bounds by
 # `(rows + columns) * max_cost`, while leaving headroom for the gap penalties that get added to
@@ -142,6 +170,7 @@ struct Step(ImplicitlyCopyable, TrivialRegisterPassable):
 
 # BLOSUM62 scaled by five, trimmed to the 23 letters the alphabet emits. The canonical table
 # is 24 by 24; its last row and column are the `*` stop codon, which `translate` never produces.
+# fmt: off
 comptime BLOSUM62_SCALED: Array[Scalar[SUBSTITUTION_DTYPE], 529] = [
         20, -5, -10, -10, 0, -5, -5, 0, -10, -5, -5, -5, -5, -10, -5, 5, 0, -15, -10, 0, -10, -5, 0,
         -5, 25, 0, -10, -15, 5, 0, -10, 0, -15, -10, 10, -5, -15, -10, -5, -5, -15, -10, -15, -5, 0, -5,
@@ -167,6 +196,7 @@ comptime BLOSUM62_SCALED: Array[Scalar[SUBSTITUTION_DTYPE], 529] = [
         -5, 0, 0, 5, -15, 15, 20, -10, 0, -15, -15, 5, -5, -15, -5, 0, -5, -15, -10, -10, 5, 20, -5,
         0, -5, -5, -5, -10, -5, -5, -5, -5, -5, -5, -5, -5, -5, -10, 0, 0, -10, -5, -5, -5, -5, -5,
 ]
+# fmt: on
 
 
 def default_proteins_matrix() -> List[Scalar[SUBSTITUTION_DTYPE]]:
@@ -210,7 +240,7 @@ def translate(text: String, alphabet: String) raises -> List[Scalar[SYMBOL_DTYPE
 
 
 @fieldwise_init
-struct AffineGapCosts(Copyable, Movable):
+struct AffineGapCosts(ImplicitlyCopyable, TrivialRegisterPassable):
     """Gotoh's two-parameter gap model. Both penalties are negative."""
 
     var open: Int32
@@ -269,32 +299,18 @@ struct Wavefront[address_space: AddressSpace](ImplicitlyCopyable, TrivialRegiste
     why a single barrier per diagonal suffices.
     """
 
-    var scores_two_back: Pointer[
-        Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space = Self.address_space
-    ]
-    var scores_one_back: Pointer[
-        Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space = Self.address_space
-    ]
-    var scores_current: Pointer[
-        Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space = Self.address_space
-    ]
-    var deletes_one_back: Pointer[
-        Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space = Self.address_space
-    ]
-    var deletes_current: Pointer[
-        Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space = Self.address_space
-    ]
-    var inserts_one_back: Pointer[
-        Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space = Self.address_space
-    ]
-    var inserts_current: Pointer[
-        Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space = Self.address_space
-    ]
+    var scores_two_back: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
+    var scores_one_back: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
+    var scores_current: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
+    var deletes_one_back: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
+    var deletes_current: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
+    var inserts_one_back: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
+    var inserts_current: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
 
     @staticmethod
     @always_inline
     def over(
-        bands: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space = Self.address_space],
+        bands: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space],
         stride: Int,
     ) -> Self:
         """Carves `BANDS_PER_SWEEP` equal bands out of one allocation."""
@@ -344,10 +360,7 @@ struct CellDecision(ImplicitlyCopyable, TrivialRegisterPassable):
     @always_inline
     def recording(source: Layer, deletion: GapRun, insertion: GapRun, reach: PathReach) -> Self:
         return Self(
-            source.identifier
-            | (deletion.identifier << 2)
-            | (insertion.identifier << 3)
-            | (reach.identifier << 7)
+            source.identifier | (deletion.identifier << 2) | (insertion.identifier << 3) | (reach.identifier << 7)
         )
 
     @always_inline
@@ -370,20 +383,10 @@ struct CellDecision(ImplicitlyCopyable, TrivialRegisterPassable):
 @always_inline
 def decide(cell: Cell, replacement: Int32, above: Cell, left: Cell, scoring: AffineGapCosts) -> CellDecision:
     """The four answers a kernel packs, re-derived from the three score layers."""
-    var deletion_run = (
-        GapRun.EXTENDS
-        if above.deletion + scoring.extend > above.score + scoring.open
-        else GapRun.OPENS
-    )
-    var insertion_run = (
-        GapRun.EXTENDS
-        if left.insertion + scoring.extend > left.score + scoring.open
-        else GapRun.OPENS
-    )
+    var deletion_run = GapRun.EXTENDS if above.deletion + scoring.extend > above.score + scoring.open else GapRun.OPENS
+    var insertion_run = GapRun.EXTENDS if left.insertion + scoring.extend > left.score + scoring.open else GapRun.OPENS
     var reach = PathReach.ENDS_HERE if cell.score <= 0 else PathReach.CONTINUES_PAST
-    return CellDecision.recording(
-        source_layer(cell, replacement), deletion_run, insertion_run, reach
-    )
+    return CellDecision.recording(source_layer(cell, replacement), deletion_run, insertion_run, reach)
 
 
 @always_inline
@@ -398,9 +401,7 @@ def advance(state: Layer, decision: CellDecision) -> Step:
         var next_layer = Layer.DELETING if decision.deletion() == GapRun.EXTENDS else Layer.ALIGNING
         return Step(-1, 0, next_layer)
     if layer == Layer.INSERTING:
-        var next_layer = (
-            Layer.INSERTING if decision.insertion() == GapRun.EXTENDS else Layer.ALIGNING
-        )
+        var next_layer = Layer.INSERTING if decision.insertion() == GapRun.EXTENDS else Layer.ALIGNING
         return Step(0, -1, next_layer)
     return Step(-1, -1, Layer.ALIGNING)
 
@@ -408,6 +409,7 @@ def advance(state: Layer, decision: CellDecision) -> Step:
 # endregion Scoring
 
 # region Serial Reference
+
 
 @fieldwise_init
 struct AlignmentResult(Copyable, Movable):
@@ -421,9 +423,9 @@ struct AlignmentResult(Copyable, Movable):
 def serial_score[
     mode: AlignmentMode
 ](
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
 ) -> Int32:
@@ -455,9 +457,7 @@ def serial_score[
         inserts_row[0] = scores_row[0] + scoring.open + scoring.extend
 
         for column in range(1, columns + 1):
-            var substitution = Int32(
-                substitutions[Int(first[row - 1]) * alphabet_size + Int(second[column - 1])]
-            )
+            var substitution = Int32(substitutions[Int(first[row - 1]) * alphabet_size + Int(second[column - 1])])
             var cell = gotoh_cell[mode](
                 scores_above[column - 1],
                 scores_above[column],
@@ -485,9 +485,9 @@ def serial_score[
 def serial_align[
     mode: AlignmentMode
 ](
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
     alphabet: String,
@@ -525,9 +525,7 @@ def serial_align[
             inserts[base] = scoring.open + scoring.extend
 
         for column in range(1, stride):
-            var substitution = Int32(
-                substitutions[Int(first[row - 1]) * alphabet_size + Int(second[column - 1])]
-            )
+            var substitution = Int32(substitutions[Int(first[row - 1]) * alphabet_size + Int(second[column - 1])])
             var cell = gotoh_cell[mode](
                 scores[above + column - 1],
                 scores[above + column],
@@ -573,13 +571,13 @@ def serial_align[
 
 
 def reconstruct(
-    scores: List[Int32],
-    deletes: List[Int32],
-    inserts: List[Int32],
+    scores: ImmSpan[Int32, _],
+    deletes: ImmSpan[Int32, _],
+    inserts: ImmSpan[Int32, _],
     stride: Int,
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     start_row: Int,
     start_column: Int,
@@ -604,9 +602,7 @@ def reconstruct(
 
     while row > 0 and column > 0:
         var here = row * stride + column
-        var substitution = Int32(
-            substitutions[Int(first[row - 1]) * alphabet_size + Int(second[column - 1])]
-        )
+        var substitution = Int32(substitutions[Int(first[row - 1]) * alphabet_size + Int(second[column - 1])])
         var decision = decide(
             Cell(scores[here], deletes[here], inserts[here]),
             scores[here - stride - 1] + substitution,
@@ -618,12 +614,8 @@ def reconstruct(
             if decision.reach() == PathReach.ENDS_HERE:
                 break
         var step = advance(state, decision)
-        first_reversed.append(
-            letters[Int(first[row - 1])] if step.row_step != 0 else GAP_BYTE
-        )
-        second_reversed.append(
-            letters[Int(second[column - 1])] if step.column_step != 0 else GAP_BYTE
-        )
+        first_reversed.append(letters[Int(first[row - 1])] if step.row_step != 0 else GAP_BYTE)
+        second_reversed.append(letters[Int(second[column - 1])] if step.column_step != 0 else GAP_BYTE)
         row += step.row_step
         column += step.column_step
         state = step.lands_in
@@ -680,18 +672,18 @@ struct Frame(Copyable, Movable, TrivialRegisterPassable):
 def sweep_bands[
     half: SweepHalf
 ](
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
     first_from: Int,
     first_to: Int,
     second_from: Int,
     second_to: Int,
     entry: GapRun,
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
-    mut final_scores: List[Int32],
-    mut final_deletes: List[Int32],
+    final_scores: MutSpan[Int32, _],
+    final_deletes: MutSpan[Int32, _],
 ):
     """Linear-space sweep of one sub-rectangle, leaving the last row's two layers behind.
 
@@ -727,9 +719,7 @@ def sweep_bands[
         var first_index = first_to - row if reversed_order else first_from + row - 1
         for column in range(1, columns + 1):
             var second_index = second_to - column if reversed_order else second_from + column - 1
-            var substitution = Int32(
-                substitutions[Int(first[first_index]) * alphabet_size + Int(second[second_index])]
-            )
+            var substitution = Int32(substitutions[Int(first[first_index]) * alphabet_size + Int(second[second_index])])
             var cell = gotoh_cell[AlignmentMode.GLOBAL](
                 scores_above[column - 1],
                 scores_above[column],
@@ -752,19 +742,19 @@ def sweep_bands[
 
 
 def direct_tile(
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
     first_from: Int,
     first_to: Int,
     second_from: Int,
     second_to: Int,
     top: GapRun,
     bottom: GapRun,
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
-    mut path_columns: List[Int32],
-    mut path_entries: List[Layer],
+    path_columns: MutSpan[Int32, _],
+    path_entries: MutSpan[Layer, _],
 ) -> Int32:
     """Solves one sub-rectangle outright and walks it back through the three layers.
 
@@ -799,10 +789,7 @@ def direct_tile(
         inserts[base] = scores[base] + scoring.open + scoring.extend
         for column in range(1, stride):
             var substitution = Int32(
-                substitutions[
-                    Int(first[first_from + row - 1]) * alphabet_size
-                    + Int(second[second_from + column - 1])
-                ]
+                substitutions[Int(first[first_from + row - 1]) * alphabet_size + Int(second[second_from + column - 1])]
             )
             var cell = gotoh_cell[AlignmentMode.GLOBAL](
                 scores[above + column - 1],
@@ -829,10 +816,7 @@ def direct_tile(
     while row > 0 and column > 0:
         var here = row * stride + column
         var substitution = Int32(
-            substitutions[
-                Int(first[first_from + row - 1]) * alphabet_size
-                + Int(second[second_from + column - 1])
-            ]
+            substitutions[Int(first[first_from + row - 1]) * alphabet_size + Int(second[second_from + column - 1])]
         )
         var decision = decide(
             Cell(scores[here], deletes[here], inserts[here]),
@@ -843,9 +827,7 @@ def direct_tile(
         )
         var step = advance(state, decision)
         if step.row_step != 0:
-            path_entries[first_from + row] = (
-                Layer.ALIGNING if step.column_step != 0 else Layer.DELETING
-            )
+            path_entries[first_from + row] = Layer.ALIGNING if step.column_step != 0 else Layer.DELETING
             path_columns[first_from + row - 1] = Int32(second_from + column + step.column_step)
         row += step.row_step
         column += step.column_step
@@ -859,19 +841,78 @@ def direct_tile(
     return scores[rows * stride + columns]
 
 
+@fieldwise_init
+struct Crossing(ImplicitlyCopyable, TrivialRegisterPassable):
+    """Where a Myers-Miller join puts the cut, and what each of its two candidates scored."""
+
+    var plain: Int32
+    var plain_column: Int
+    var gapped: Int32
+
+
+def tile_frame(
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    frame: Frame,
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
+    alphabet_size: Int,
+    scoring: AffineGapCosts,
+    path_columns: MutSpan[Int32, _],
+    path_entries: MutSpan[Layer, _],
+):
+    """Solves one pending subproblem outright, which is how every branch of the recursion ends."""
+    _ = direct_tile(
+        first,
+        second,
+        frame.first_from,
+        frame.first_to,
+        frame.second_from,
+        frame.second_to,
+        frame.top,
+        frame.bottom,
+        substitutions,
+        alphabet_size,
+        scoring,
+        path_columns,
+        path_entries,
+    )
+
+
+def best_crossing(
+    forward_scores: ImmSpan[Int32, _],
+    forward_deletes: ImmSpan[Int32, _],
+    reverse_scores: ImmSpan[Int32, _],
+    reverse_deletes: ImmSpan[Int32, _],
+    width: Int,
+    scoring: AffineGapCosts,
+) -> Crossing:
+    """Scans the two frontiers for the best cut, in the match layer and across a straddling run."""
+    var best = Crossing(NEGATIVE_INFINITY, 0, NEGATIVE_INFINITY)
+    var refund = scoring.extend - scoring.open
+    for offset in range(width + 1):
+        var plain = forward_scores[offset] + reverse_scores[width - offset]
+        if plain > best.plain:
+            best.plain = plain
+            best.plain_column = offset
+        var gapped = forward_deletes[offset] + reverse_deletes[width - offset] + refund
+        if gapped > best.gapped:
+            best.gapped = gapped
+    return best
+
+
 def hirschberg_window(
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
     window_first_from: Int,
     window_first_to: Int,
     window_second_from: Int,
     window_second_to: Int,
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
     tile_cells: Int,
-    mut path_columns: List[Int32],
-    mut path_entries: List[Layer],
+    path_columns: MutSpan[Int32, _],
+    path_entries: MutSpan[Layer, _],
 ) raises:
     """Linear-space traceback: split on rows, join the two halves, recurse without recursion.
 
@@ -889,8 +930,12 @@ def hirschberg_window(
     var frames = List[Frame]()
     frames.append(
         Frame(
-            window_first_from, window_first_to, window_second_from, window_second_to,
-            GapRun.OPENS, GapRun.OPENS,
+            window_first_from,
+            window_first_to,
+            window_second_from,
+            window_second_to,
+            GapRun.OPENS,
+            GapRun.OPENS,
         )
     )
 
@@ -913,42 +958,66 @@ def hirschberg_window(
         if height == 0:
             continue
         if width == 0 or height <= 2 or (height + 1) * (width + 1) <= tile_cells:
-            _ = direct_tile(
-                first, second, first_from, first_to, second_from, second_to, top, bottom,
-                substitutions, alphabet_size, scoring, path_columns, path_entries,
+            tile_frame(
+                first,
+                second,
+                frame,
+                substitutions,
+                alphabet_size,
+                scoring,
+                path_columns,
+                path_entries,
             )
             continue
 
         var split = (first_from + first_to) // 2
         sweep_bands[SweepHalf.FORWARD](
-            first, second, first_from, split, second_from, second_to, top,
-            substitutions, alphabet_size, scoring, forward_scores, forward_deletes,
+            first,
+            second,
+            first_from,
+            split,
+            second_from,
+            second_to,
+            top,
+            substitutions,
+            alphabet_size,
+            scoring,
+            forward_scores,
+            forward_deletes,
         )
         sweep_bands[SweepHalf.REVERSE](
-            first, second, split, first_to, second_from, second_to, bottom,
-            substitutions, alphabet_size, scoring, reverse_scores, reverse_deletes,
+            first,
+            second,
+            split,
+            first_to,
+            second_from,
+            second_to,
+            bottom,
+            substitutions,
+            alphabet_size,
+            scoring,
+            reverse_scores,
+            reverse_deletes,
         )
 
-        var best_plain = NEGATIVE_INFINITY
-        var best_plain_column = 0
-        var best_gapped = NEGATIVE_INFINITY
-        var refund = scoring.extend - scoring.open
-        for offset in range(width + 1):
-            var plain = forward_scores[offset] + reverse_scores[width - offset]
-            if plain > best_plain:
-                best_plain = plain
-                best_plain_column = offset
-            var gapped = forward_deletes[offset] + reverse_deletes[width - offset] + refund
-            if gapped > best_gapped:
-                best_gapped = gapped
+        var join = best_crossing(forward_scores, forward_deletes, reverse_scores, reverse_deletes, width, scoring)
+        var best_plain = join.plain
+        var best_plain_column = join.plain_column
+        var best_gapped = join.gapped
 
         # Take the answer from the branch actually followed. The gapped candidate can overshoot
         # the true optimum on degenerate rectangles, where the delete layers at the extreme
         # columns are still sentinels rather than reachable values.
         if best_gapped > best_plain:
-            _ = direct_tile(
-                first, second, first_from, first_to, second_from, second_to, top, bottom,
-                substitutions, alphabet_size, scoring, path_columns, path_entries,
+            tile_frame(
+                first,
+                second,
+                frame,
+                substitutions,
+                alphabet_size,
+                scoring,
+                path_columns,
+                path_entries,
             )
             continue
 
@@ -959,11 +1028,11 @@ def hirschberg_window(
 
 
 def score_path(
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
-    path_columns: List[Int32],
-    path_entries: List[Layer],
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    path_columns: ImmSpan[Int32, _],
+    path_entries: ImmSpan[Layer, _],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
     rows: Int,
@@ -991,9 +1060,7 @@ def score_path(
             in_first = False
             in_second = True
         else:
-            total += Int32(
-                substitutions[Int(first[row - 1]) * alphabet_size + Int(second[before])]
-            )
+            total += Int32(substitutions[Int(first[row - 1]) * alphabet_size + Int(second[before])])
             before += 1
             in_first = False
             in_second = False
@@ -1006,10 +1073,10 @@ def score_path(
 
 
 def expand_path(
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
-    path_columns: List[Int32],
-    path_entries: List[Layer],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    path_columns: ImmSpan[Int32, _],
+    path_entries: ImmSpan[Layer, _],
     alphabet: String,
     mode: AlignmentMode,
     from_row: Int,
@@ -1048,11 +1115,11 @@ def expand_path(
 def local_extremum[
     half: SweepHalf
 ](
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
     first_to: Int,
     second_to: Int,
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
 ) -> Tuple[Int, Int, Int32]:
@@ -1082,9 +1149,7 @@ def local_extremum[
         var first_index = first_to - row if reversed_order else row - 1
         for column in range(1, second_to + 1):
             var second_index = second_to - column if reversed_order else column - 1
-            var substitution = Int32(
-                substitutions[Int(first[first_index]) * alphabet_size + Int(second[second_index])]
-            )
+            var substitution = Int32(substitutions[Int(first[first_index]) * alphabet_size + Int(second[second_index])])
             var cell = gotoh_cell[AlignmentMode.LOCAL](
                 scores_above[column - 1],
                 scores_above[column],
@@ -1106,6 +1171,7 @@ def local_extremum[
 
     return (best_row, best_column, best)
 
+
 # endregion Serial Reference
 
 
@@ -1114,8 +1180,8 @@ def local_extremum[
 
 @always_inline
 def block_argmax(
-    scores: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space = AddressSpace.SHARED],
-    places: Pointer[Scalar[DType.int64], MutUntrackedOrigin, address_space = AddressSpace.SHARED],
+    scores: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=AddressSpace.SHARED],
+    places: Pointer[Scalar[DType.int64], MutUntrackedOrigin, address_space=AddressSpace.SHARED],
     best: Int32,
     best_place: Int64,
 ):
@@ -1136,9 +1202,7 @@ def block_argmax(
             var mine = scores[unsafe_offset=here]
             var theirs = scores[unsafe_offset=there]
             if theirs > mine or (
-                theirs == mine
-                and theirs != 0
-                and places[unsafe_offset=there] < places[unsafe_offset=here]
+                theirs == mine and theirs != 0 and places[unsafe_offset=there] < places[unsafe_offset=here]
             ):
                 scores[unsafe_offset=here] = theirs
                 places[unsafe_offset=here] = places[unsafe_offset=there]
@@ -1153,6 +1217,7 @@ def wavefront_kernel[
     offsets: Pointer[Scalar[OFFSET_DTYPE], MutAnyOrigin],
     substitutions: Pointer[Scalar[SUBSTITUTION_DTYPE], MutAnyOrigin],
     results: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
+    band_stride: Int32,
     alphabet_size: Int32,
     open: Int32,
     extend: Int32,
@@ -1171,11 +1236,9 @@ def wavefront_kernel[
     var columns = Int(offsets[unsafe_offset=2 * pair + 2]) - second_start
     var width = Int(alphabet_size)
 
-    var bands = stack_allocation[
-        BANDS_PER_SWEEP * (MAX_BAND_LENGTH + 1), Scalar[SCORE_DTYPE], address_space = AddressSpace.SHARED
-    ]()
+    var bands = external_memory[Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED, alignment=16, name="bands"]()
 
-    var stride = MAX_BAND_LENGTH + 1
+    var stride = Int(band_stride)
     var wavefront = Wavefront.over(bands, stride)
 
     # The substitution table is read once per cell, so it is staged into shared memory rather
@@ -1183,7 +1246,7 @@ def wavefront_kernel[
     var scores_table = stack_allocation[
         MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE,
         Scalar[SUBSTITUTION_DTYPE],
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
     ]()
     for index in range(Int(thread_idx.x), width * width, Int(block_dim.x)):
         scores_table[unsafe_offset=index] = substitutions[unsafe_offset=index]
@@ -1193,7 +1256,7 @@ def wavefront_kernel[
     var last_diagonal = rows + columns
 
     for diagonal in range(0, last_diagonal + 1):
-        var row_low = diagonal - min(diagonal, columns)
+        var row_low = max(0, diagonal - columns)
         var row_high = min(rows, diagonal)
 
         for row in range(row_low + Int(thread_idx.x), row_high + 1, THREADS_PER_BLOCK):
@@ -1225,9 +1288,7 @@ def wavefront_kernel[
             else:
                 var left_symbol = Int(sequences[unsafe_offset=first_start + row - 1])
                 var right_symbol = Int(sequences[unsafe_offset=second_start + column - 1])
-                var substitution = Int32(
-                    scores_table[unsafe_offset=left_symbol * width + right_symbol]
-                )
+                var substitution = Int32(scores_table[unsafe_offset=left_symbol * width + right_symbol])
                 var computed = gotoh_cell[mode](
                     wavefront.scores_two_back[unsafe_offset=row - 1],
                     wavefront.scores_one_back[unsafe_offset=row - 1],
@@ -1261,13 +1322,11 @@ def wavefront_kernel[
             results[unsafe_offset=pair] = highest
 
 
-def upload[
-    dtype: DType
-](ctx: DeviceContext, values: List[Scalar[dtype]]) raises -> DeviceBuffer[dtype]:
-    """Stages a list onto the device, keeping a one-element floor so an empty batch is not a case."""
+def upload[dtype: DType](ctx: DeviceContext, values: ImmSpan[Scalar[dtype], _]) raises -> DeviceBuffer[dtype]:
+    """Stages values onto the device, keeping a one-element floor so an empty batch is not a case."""
     var buffer = ctx.enqueue_create_buffer[dtype](max(len(values), 1))
     if len(values) > 0:
-        ctx.enqueue_copy(buffer, Span(values))
+        ctx.enqueue_copy(buffer, values)
     return buffer^
 
 
@@ -1282,9 +1341,9 @@ def wavefront_scores[
     mode: AlignmentMode
 ](
     ctx: DeviceContext,
-    sequences: List[Scalar[SYMBOL_DTYPE]],
+    sequences: ImmSpan[Scalar[SYMBOL_DTYPE], _],
     offsets: List[Scalar[OFFSET_DTYPE]],
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
 ) raises -> List[Int32]:
@@ -1292,6 +1351,14 @@ def wavefront_scores[
     var pairs = (len(offsets) - 1) // 2
     if alphabet_size > MAX_ALPHABET_SIZE:
         raise Error("Alphabet exceeds the shared-memory substitution table capacity.")
+
+    # The bands are indexed by row, so one launch only needs the longest first sequence it carries.
+    var longest_first = 0
+    for pair in range(pairs):
+        longest_first = max(longest_first, Int(offsets[2 * pair + 1]) - Int(offsets[2 * pair]))
+    var band_stride = longest_first + 1
+    var dynamic_bytes = band_bytes(band_stride)
+
     var sequences_buffer = upload(ctx, sequences)
     var offsets_buffer = upload(ctx, offsets)
     var substitutions_buffer = upload(ctx, substitutions)
@@ -1302,11 +1369,14 @@ def wavefront_scores[
         offsets_buffer.unsafe_ptr(),
         substitutions_buffer.unsafe_ptr(),
         results_buffer.unsafe_ptr(),
+        Int32(band_stride),
         Int32(alphabet_size),
         scoring.open,
         scoring.extend,
         grid_dim=pairs,
         block_dim=THREADS_PER_BLOCK,
+        shared_mem_bytes=dynamic_bytes,
+        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(dynamic_bytes)),
     )
     ctx.synchronize()
 
@@ -1331,6 +1401,7 @@ def direct_align_kernel[
     second_gapped: Pointer[Scalar[SYMBOL_DTYPE], MutAnyOrigin],
     gapped_lengths: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
     gapped_stride: Int32,
+    band_stride: Int32,
     alphabet_size: Int32,
     open: Int32,
     extend: Int32,
@@ -1351,17 +1422,11 @@ def direct_align_kernel[
     var stride = columns + 1
     var tile = Int(change_offsets[unsafe_offset=pair])
 
-    var bands = stack_allocation[
-        BANDS_PER_SWEEP * (MAX_BAND_LENGTH + 1), Scalar[SCORE_DTYPE], address_space = AddressSpace.SHARED
-    ]()
-    var best_scores = stack_allocation[
-        THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space = AddressSpace.SHARED
-    ]()
-    var best_places = stack_allocation[
-        THREADS_PER_BLOCK, Scalar[DType.int64], address_space = AddressSpace.SHARED
-    ]()
+    var bands = external_memory[Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED, alignment=16, name="bands"]()
+    var best_scores = stack_allocation[THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED]()
+    var best_places = stack_allocation[THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED]()
 
-    var band = MAX_BAND_LENGTH + 1
+    var band = Int(band_stride)
     var wavefront = Wavefront.over(bands, band)
 
     # The substitution table is read once per cell, so it is staged into shared memory rather
@@ -1369,7 +1434,7 @@ def direct_align_kernel[
     var scores_table = stack_allocation[
         MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE,
         Scalar[SUBSTITUTION_DTYPE],
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
     ]()
     for index in range(Int(thread_idx.x), width * width, Int(block_dim.x)):
         scores_table[unsafe_offset=index] = substitutions[unsafe_offset=index]
@@ -1381,7 +1446,7 @@ def direct_align_kernel[
     var last_diagonal = rows + columns
 
     for diagonal in range(0, last_diagonal + 1):
-        var row_low = diagonal - min(diagonal, columns)
+        var row_low = max(0, diagonal - columns)
         var row_high = min(rows, diagonal)
 
         for row in range(row_low + Int(thread_idx.x), row_high + 1, THREADS_PER_BLOCK):
@@ -1415,9 +1480,7 @@ def direct_align_kernel[
             else:
                 var left_symbol = Int(sequences[unsafe_offset=first_start + row - 1])
                 var right_symbol = Int(sequences[unsafe_offset=second_start + column - 1])
-                var substitution = Int32(
-                    scores_table[unsafe_offset=left_symbol * width + right_symbol]
-                )
+                var substitution = Int32(scores_table[unsafe_offset=left_symbol * width + right_symbol])
                 var replacement = wavefront.scores_two_back[unsafe_offset=row - 1] + substitution
                 var computed = gotoh_cell[mode](
                     wavefront.scores_two_back[unsafe_offset=row - 1],
@@ -1497,14 +1560,11 @@ def direct_align_kernel[
         var step = advance(state, decision)
         var gap = Scalar[SYMBOL_DTYPE](GAP_BYTE)
         first_gapped[unsafe_offset=base + produced] = (
-            letters[unsafe_offset=Int(sequences[unsafe_offset=first_start + row - 1])]
-            if step.row_step != 0
-            else gap
+            letters[unsafe_offset=Int(sequences[unsafe_offset=first_start + row - 1])] if step.row_step != 0 else gap
         )
         second_gapped[unsafe_offset=base + produced] = (
-            letters[unsafe_offset=Int(sequences[unsafe_offset=second_start + column - 1])]
-            if step.column_step != 0
-            else gap
+            letters[unsafe_offset=Int(sequences[unsafe_offset=second_start + column - 1])] if step.column_step
+            != 0 else gap
         )
         row += step.row_step
         column += step.column_step
@@ -1536,9 +1596,9 @@ def direct_alignments[
     mode: AlignmentMode
 ](
     ctx: DeviceContext,
-    sequences: List[Scalar[SYMBOL_DTYPE]],
+    sequences: ImmSpan[Scalar[SYMBOL_DTYPE], _],
     offsets: List[Scalar[OFFSET_DTYPE]],
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet: String,
     scoring: AffineGapCosts,
 ) raises -> List[AlignmentResult]:
@@ -1552,8 +1612,10 @@ def direct_alignments[
     var change_offsets = List[Int64](capacity=pairs + 1)
     var running = Int64(0)
     var widest = 1
+    var longest_first = 0
     for pair in range(pairs):
         var rows = Int(offsets[2 * pair + 1]) - Int(offsets[2 * pair])
+        longest_first = max(longest_first, rows)
         var columns = Int(offsets[2 * pair + 2]) - Int(offsets[2 * pair + 1])
         change_offsets.append(running)
         running += Int64(rows + 1) * Int64(columns + 1)
@@ -1574,7 +1636,6 @@ def direct_alignments[
     var second_buffer = ctx.enqueue_create_buffer[SYMBOL_DTYPE](max(pairs * widest, 1))
     var lengths_buffer = zeroed[SCORE_DTYPE](ctx, pairs)
 
-
     ctx.enqueue_function[direct_align_kernel[mode]](
         sequences_buffer.unsafe_ptr(),
         offsets_buffer.unsafe_ptr(),
@@ -1587,11 +1648,14 @@ def direct_alignments[
         second_buffer.unsafe_ptr(),
         lengths_buffer.unsafe_ptr(),
         Int32(widest),
+        Int32(longest_first + 1),
         Int32(alphabet_size),
         scoring.open,
         scoring.extend,
         grid_dim=pairs,
         block_dim=THREADS_PER_BLOCK,
+        shared_mem_bytes=band_bytes(longest_first + 1),
+        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(band_bytes(longest_first + 1))),
     )
     ctx.synchronize()
 
@@ -1617,18 +1681,18 @@ def direct_alignments[
 
 def hirschberg_path_gpu(
     ctx: DeviceContext,
-    first: List[Scalar[SYMBOL_DTYPE]],
-    second: List[Scalar[SYMBOL_DTYPE]],
+    first: ImmSpan[Scalar[SYMBOL_DTYPE], _],
+    second: ImmSpan[Scalar[SYMBOL_DTYPE], _],
     window_first_from: Int,
     window_first_to: Int,
     window_second_from: Int,
     window_second_to: Int,
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
     tile_cells: Int,
-    mut path_columns: List[Int32],
-    mut path_entries: List[Layer],
+    path_columns: MutSpan[Int32, _],
+    path_entries: MutSpan[Layer, _],
 ) raises:
     """Hirschberg with every sweep on the device.
 
@@ -1671,8 +1735,12 @@ def hirschberg_path_gpu(
     var frames = List[Frame]()
     frames.append(
         Frame(
-            window_first_from, window_first_to, window_second_from, window_second_to,
-            GapRun.OPENS, GapRun.OPENS,
+            window_first_from,
+            window_first_to,
+            window_second_from,
+            window_second_to,
+            GapRun.OPENS,
+            GapRun.OPENS,
         )
     )
 
@@ -1690,21 +1758,41 @@ def hirschberg_path_gpu(
         if height == 0:
             continue
         if width == 0 or height <= 2 or (height + 1) * (width + 1) <= tile_cells:
-            _ = direct_tile(
-                first, second, first_from, first_to, second_from, second_to, top, bottom,
-                substitutions, alphabet_size, scoring, path_columns, path_entries,
+            tile_frame(
+                first,
+                second,
+                frame,
+                substitutions,
+                alphabet_size,
+                scoring,
+                path_columns,
+                path_entries,
             )
             continue
 
         var split = (first_from + first_to) // 2
         # The second sequence is stored after the first, so its indices carry that offset.
         tiled_sweep[SweepHalf.FORWARD](
-            ctx, buffers, split - first_from, second_to - second_from,
-            first_from, rows + second_from, top, alphabet_size, scoring,
+            ctx,
+            buffers,
+            split - first_from,
+            second_to - second_from,
+            first_from,
+            rows + second_from,
+            top,
+            alphabet_size,
+            scoring,
         )
         tiled_sweep[SweepHalf.REVERSE](
-            ctx, buffers, first_to - split, second_to - second_from,
-            split, rows + second_from, bottom, alphabet_size, scoring,
+            ctx,
+            buffers,
+            first_to - split,
+            second_to - second_from,
+            split,
+            rows + second_from,
+            bottom,
+            alphabet_size,
+            scoring,
         )
         ctx.enqueue_function[crossing_kernel](
             buffers.top_scores.unsafe_ptr(),
@@ -1731,9 +1819,15 @@ def hirschberg_path_gpu(
         # the true optimum on degenerate rectangles, where the delete layers at the extreme
         # columns are still sentinels rather than reachable values.
         if best_gapped > best_plain:
-            _ = direct_tile(
-                first, second, first_from, first_to, second_from, second_to, top, bottom,
-                substitutions, alphabet_size, scoring, path_columns, path_entries,
+            tile_frame(
+                first,
+                second,
+                frame,
+                substitutions,
+                alphabet_size,
+                scoring,
+                path_columns,
+                path_entries,
             )
             continue
 
@@ -1774,14 +1868,10 @@ def local_extremum_kernel[
     var scores_table = stack_allocation[
         MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE,
         Scalar[SUBSTITUTION_DTYPE],
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
     ]()
-    var best_scores = stack_allocation[
-        THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space = AddressSpace.SHARED
-    ]()
-    var best_places = stack_allocation[
-        THREADS_PER_BLOCK, Scalar[DType.int64], address_space = AddressSpace.SHARED
-    ]()
+    var best_scores = stack_allocation[THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED]()
+    var best_places = stack_allocation[THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED]()
     for index in range(Int(thread_idx.x), width * width, Int(block_dim.x)):
         scores_table[unsafe_offset=index] = substitutions[unsafe_offset=index]
     barrier()
@@ -1793,7 +1883,7 @@ def local_extremum_kernel[
     var last_diagonal = rows + columns
 
     for diagonal in range(0, last_diagonal + 1):
-        var row_low = diagonal - min(diagonal, columns)
+        var row_low = max(0, diagonal - columns)
         var row_high = min(rows, diagonal)
 
         for row in range(row_low + Int(thread_idx.x), row_high + 1, Int(block_dim.x)):
@@ -1803,17 +1893,11 @@ def local_extremum_kernel[
             var insertion = open + extend
 
             if row > 0 and column > 0:
-                var left_index = (
-                    Int(first_to) - row if reversed_order else Int(first_from) + row - 1
-                )
-                var right_index = (
-                    Int(second_to) - column if reversed_order else Int(second_from) + column - 1
-                )
+                var left_index = Int(first_to) - row if reversed_order else Int(first_from) + row - 1
+                var right_index = Int(second_to) - column if reversed_order else Int(second_from) + column - 1
                 var left_symbol = Int(sequences[unsafe_offset=left_index])
                 var right_symbol = Int(sequences[unsafe_offset=right_index])
-                var substitution = Int32(
-                    scores_table[unsafe_offset=left_symbol * width + right_symbol]
-                )
+                var substitution = Int32(scores_table[unsafe_offset=left_symbol * width + right_symbol])
                 var computed = gotoh_cell[AlignmentMode.LOCAL](
                     wavefront.scores_two_back[unsafe_offset=row - 1],
                     wavefront.scores_one_back[unsafe_offset=row - 1],
@@ -1902,12 +1986,12 @@ def tiled_sweep_kernel[
     var scoring = AffineGapCosts(open, extend)
 
     var bands = stack_allocation[
-        BANDS_PER_SWEEP * (TILE_SIDE + 1), Scalar[SCORE_DTYPE], address_space = AddressSpace.SHARED
+        BANDS_PER_SWEEP * (TILE_SIDE + 1), Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED
     ]()
     var scores_table = stack_allocation[
         MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE,
         Scalar[SUBSTITUTION_DTYPE],
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
     ]()
     for index in range(Int(thread_idx.x), width * width, Int(block_dim.x)):
         scores_table[unsafe_offset=index] = substitutions[unsafe_offset=index]
@@ -1917,7 +2001,7 @@ def tiled_sweep_kernel[
 
     var last_diagonal = height + width_span
     for diagonal in range(0, last_diagonal + 1):
-        var row_low = diagonal - min(diagonal, width_span)
+        var row_low = max(0, diagonal - width_span)
         var row_high = min(height, diagonal)
 
         for local_row in range(row_low + Int(thread_idx.x), row_high + 1, Int(block_dim.x)):
@@ -1940,15 +2024,11 @@ def tiled_sweep_kernel[
                     deletion = cell if extends else cell + open + extend
                     insertion = deletion
                 elif column == 0:
-                    cell = Int32(row) * extend if extends else open + Int32(
-                        row - 1
-                    ) * extend
+                    cell = Int32(row) * extend if extends else open + Int32(row - 1) * extend
                     deletion = cell
                     insertion = cell + open + extend
                 elif local_row == 0 and local_column == 0:
-                    cell = corner_scores[
-                        unsafe_offset=tile_row * Int(tile_columns_count) + tile_column
-                    ]
+                    cell = corner_scores[unsafe_offset=tile_row * Int(tile_columns_count) + tile_column]
                     deletion = cell + open + extend
                     insertion = deletion
                 elif local_row == 0:
@@ -1960,19 +2040,13 @@ def tiled_sweep_kernel[
                     insertion = left_inserts[unsafe_offset=row]
                     deletion = cell + open + extend
             else:
-                var left_index = (
-                    Int(first_from) + Int(rows) - row if reversed_order else Int(first_from) + row - 1
-                )
+                var left_index = Int(first_from) + Int(rows) - row if reversed_order else Int(first_from) + row - 1
                 var right_index = (
-                    Int(second_from) + Int(columns) - column
-                    if reversed_order
-                    else Int(second_from) + column - 1
+                    Int(second_from) + Int(columns) - column if reversed_order else Int(second_from) + column - 1
                 )
                 var left_symbol = Int(sequences[unsafe_offset=left_index])
                 var right_symbol = Int(sequences[unsafe_offset=right_index])
-                var substitution = Int32(
-                    scores_table[unsafe_offset=left_symbol * width + right_symbol]
-                )
+                var substitution = Int32(scores_table[unsafe_offset=left_symbol * width + right_symbol])
                 var computed = gotoh_cell[AlignmentMode.GLOBAL](
                     wavefront.scores_two_back[unsafe_offset=local_row - 1],
                     wavefront.scores_one_back[unsafe_offset=local_row - 1],
@@ -2002,9 +2076,7 @@ def tiled_sweep_kernel[
                 left_scores[unsafe_offset=row] = cell
                 left_inserts[unsafe_offset=row] = insertion
             if local_row == height and local_column == width_span:
-                corner_scores[
-                    unsafe_offset=(tile_row + 1) * Int(tile_columns_count) + tile_column + 1
-                ] = cell
+                corner_scores[unsafe_offset=(tile_row + 1) * Int(tile_columns_count) + tile_column + 1] = cell
 
         barrier()
 
@@ -2050,11 +2122,7 @@ def crossing_kernel(
         if plain > best_plain:
             best_plain = plain
             best_plain_column = Int32(offset)
-        var gapped = (
-            forward_deletes[unsafe_offset=offset]
-            + reverse_deletes[unsafe_offset=span - offset]
-            + refund
-        )
+        var gapped = forward_deletes[unsafe_offset=offset] + reverse_deletes[unsafe_offset=span - offset] + refund
         if gapped > best_gapped:
             best_gapped = gapped
     crossing[unsafe_offset=0] = best_plain
@@ -2116,10 +2184,12 @@ def tiled_sweep[
             block_dim=THREADS_PER_BLOCK,
         )
 
+
 # endregion GPU Wavefront
 
 
 # region Presentation
+
 
 def colorize(first_gapped: String, second_gapped: String) raises -> Tuple[String, String]:
     """Green for a match, red for a mismatch, dim for a gap, mirroring `colorize_alignment`."""
@@ -2149,6 +2219,7 @@ def colorize(first_gapped: String, second_gapped: String) raises -> Tuple[String
 # endregion Presentation
 
 # region Python Bindings
+
 
 def optional_int(value: PythonObject) -> Optional[Int]:
     """Reads a Python argument that may be `None`, without asking Python what `None` is."""
@@ -2184,17 +2255,20 @@ def matrix_from(substitution: PythonObject, alphabet_size: Int) raises -> List[S
     return uniform_matrix(alphabet_size, given_match.value(), given_mismatch.value())
 
 
+def protein_defaults(gaps: PythonObject) raises -> Tuple[String, Int, AffineGapCosts]:
+    """The alphabet, its size and the gap costs a binding call resolves to.
+
+    The substitution table stays out of this because a `List` cannot be copied out of a tuple,
+    and it is the one part that needs the alphabet size first anyway.
+    """
+    var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
+    return (alphabet, alphabet.byte_length(), scoring_from(gaps))
+
+
 def gotoh_score[
     mode: AlignmentMode
-](
-    first: PythonObject,
-    second: PythonObject,
-    substitution: PythonObject,
-    gaps: PythonObject,
-) raises -> PythonObject:
-    var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
-    var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gaps)
+](first: PythonObject, second: PythonObject, substitution: PythonObject, gaps: PythonObject,) raises -> PythonObject:
+    var alphabet, alphabet_size, scoring = protein_defaults(gaps)
     var substitutions = matrix_from(substitution, alphabet_size)
     var left = translate(String(first), alphabet)
     var right = translate(String(second), alphabet)
@@ -2203,15 +2277,8 @@ def gotoh_score[
 
 def gotoh_alignment[
     mode: AlignmentMode
-](
-    first: PythonObject,
-    second: PythonObject,
-    substitution: PythonObject,
-    gaps: PythonObject,
-) raises -> PythonObject:
-    var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
-    var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gaps)
+](first: PythonObject, second: PythonObject, substitution: PythonObject, gaps: PythonObject,) raises -> PythonObject:
+    var alphabet, alphabet_size, scoring = protein_defaults(gaps)
     var substitutions = matrix_from(substitution, alphabet_size)
     var left = translate(String(first), alphabet)
     var right = translate(String(second), alphabet)
@@ -2229,21 +2296,14 @@ def python_length(value: PythonObject) raises -> Int:
 
 def gotoh_scores_batch[
     mode: AlignmentMode
-](
-    firsts: PythonObject,
-    seconds: PythonObject,
-    substitution: PythonObject,
-    gaps: PythonObject,
-) raises -> PythonObject:
+](firsts: PythonObject, seconds: PythonObject, substitution: PythonObject, gaps: PythonObject,) raises -> PythonObject:
     """Scores a whole batch on the GPU, one thread block per pair.
 
     Both sides are packed into one Arrow-like tape — every sequence concatenated into a flat
     symbol buffer, with an offset array carrying two entries per pair — so a batch reaches the
     device as two buffers rather than as one transfer per sequence.
     """
-    var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
-    var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gaps)
+    var alphabet, alphabet_size, scoring = protein_defaults(gaps)
     var substitutions = matrix_from(substitution, alphabet_size)
 
     var pairs = python_length(firsts)
@@ -2267,9 +2327,7 @@ def gotoh_scores_batch[
         offsets.append(Scalar[OFFSET_DTYPE](len(sequences)))
 
     var ctx = DeviceContext()
-    var scores = wavefront_scores[mode](
-        ctx, sequences, offsets, substitutions, alphabet_size, scoring
-    )
+    var scores = wavefront_scores[mode](ctx, sequences, offsets, substitutions, alphabet_size, scoring)
     var output = Python().list()
     for index in range(len(scores)):
         output.append(PythonObject(Int(scores[index])))
@@ -2278,19 +2336,12 @@ def gotoh_scores_batch[
 
 def gotoh_alignments_batch[
     mode: AlignmentMode
-](
-    firsts: PythonObject,
-    seconds: PythonObject,
-    substitution: PythonObject,
-    gaps: PythonObject,
-) raises -> PythonObject:
+](firsts: PythonObject, seconds: PythonObject, substitution: PythonObject, gaps: PythonObject,) raises -> PythonObject:
     """Aligns a whole batch on the GPU, returning `[first_gapped, second_gapped, score]` triples.
 
     Packed into the same Arrow-like tape the scoring batch uses.
     """
-    var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
-    var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gaps)
+    var alphabet, alphabet_size, scoring = protein_defaults(gaps)
     var substitutions = matrix_from(substitution, alphabet_size)
 
     var pairs = python_length(firsts)
@@ -2314,9 +2365,7 @@ def gotoh_alignments_batch[
         offsets.append(Scalar[OFFSET_DTYPE](len(sequences)))
 
     var ctx = DeviceContext()
-    var aligned = direct_alignments[mode](
-        ctx, sequences, offsets, substitutions, alphabet, scoring
-    )
+    var aligned = direct_alignments[mode](ctx, sequences, offsets, substitutions, alphabet, scoring)
     var output = Python().list()
     for index in range(len(aligned)):
         var triple = Python().list()
@@ -2398,9 +2447,7 @@ def needleman_wunsch_gotoh_alignment_linear(
     are split. Raising it past the whole matrix collapses to a single direct traceback, which is
     what makes the two paths comparable.
     """
-    var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
-    var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gaps)
+    var alphabet, alphabet_size, scoring = protein_defaults(gaps)
     var substitutions = matrix_from(substitution, alphabet_size)
     var cells = DEFAULT_TILE_CELLS
     var left = translate(String(first), alphabet)
@@ -2409,12 +2456,20 @@ def needleman_wunsch_gotoh_alignment_linear(
     var path_columns = List[Int32](length=len(left) + 1, fill=Int32(0))
     var path_entries = List[Layer](length=len(left) + 1, fill=Layer.ALIGNING)
     hirschberg_window(
-        left, right, 0, len(left), 0, len(right),
-        substitutions, alphabet_size, scoring, cells, path_columns, path_entries,
+        left,
+        right,
+        0,
+        len(left),
+        0,
+        len(right),
+        substitutions,
+        alphabet_size,
+        scoring,
+        cells,
+        path_columns,
+        path_entries,
     )
-    var score = score_path(
-        left, right, path_columns, path_entries, substitutions, alphabet_size, scoring, len(left)
-    )
+    var score = score_path(left, right, path_columns, path_entries, substitutions, alphabet_size, scoring, len(left))
     var expanded = expand_path(left, right, path_columns, path_entries, alphabet, AlignmentMode.GLOBAL, 0, len(left))
     var triple = Python().list()
     triple.append(PythonObject(expanded[0]))
@@ -2430,9 +2485,7 @@ def needleman_wunsch_gotoh_alignment_linear_gpu(
     gaps: PythonObject,
 ) raises -> PythonObject:
     """Global alignment in linear space with every sweep running on the device."""
-    var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
-    var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gaps)
+    var alphabet, alphabet_size, scoring = protein_defaults(gaps)
     var substitutions = matrix_from(substitution, alphabet_size)
     var cells = DEFAULT_TILE_CELLS
     var left = translate(String(first), alphabet)
@@ -2442,12 +2495,21 @@ def needleman_wunsch_gotoh_alignment_linear_gpu(
     var path_entries = List[Layer](length=len(left) + 1, fill=Layer.ALIGNING)
     var ctx = DeviceContext()
     hirschberg_path_gpu(
-        ctx, left, right, 0, len(left), 0, len(right),
-        substitutions, alphabet_size, scoring, cells, path_columns, path_entries,
+        ctx,
+        left,
+        right,
+        0,
+        len(left),
+        0,
+        len(right),
+        substitutions,
+        alphabet_size,
+        scoring,
+        cells,
+        path_columns,
+        path_entries,
     )
-    var score = score_path(
-        left, right, path_columns, path_entries, substitutions, alphabet_size, scoring, len(left)
-    )
+    var score = score_path(left, right, path_columns, path_entries, substitutions, alphabet_size, scoring, len(left))
     var expanded = expand_path(left, right, path_columns, path_entries, alphabet, AlignmentMode.GLOBAL, 0, len(left))
     var triple = Python().list()
     triple.append(PythonObject(expanded[0]))
@@ -2474,31 +2536,26 @@ def smith_waterman_gotoh_alignment_linear(
     because it keeps one well-understood global recursion instead of four subproblem modes, which
     is what Myers-Miller's own authors prescribe.
     """
-    var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
-    var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gaps)
+    var alphabet, alphabet_size, scoring = protein_defaults(gaps)
     var substitutions = matrix_from(substitution, alphabet_size)
     var cells = DEFAULT_TILE_CELLS
     var left = translate(String(first), alphabet)
     var right = translate(String(second), alphabet)
 
-    var ending = local_extremum[SweepHalf.FORWARD](
+    var last_row, last_column, score = local_extremum[SweepHalf.FORWARD](
         left, right, len(left), len(right), substitutions, alphabet_size, scoring
     )
-    var last_row = ending[0]
-    var last_column = ending[1]
-    var score = ending[2]
 
     var path_columns = List[Int32](length=len(left) + 1, fill=Int32(0))
     var path_entries = List[Layer](length=len(left) + 1, fill=Layer.ALIGNING)
 
     var first_row = last_row
     if score > 0:
-        var beginning = local_extremum[SweepHalf.REVERSE](
+        var back_rows, back_columns, _ = local_extremum[SweepHalf.REVERSE](
             left, right, last_row, last_column, substitutions, alphabet_size, scoring
         )
-        first_row = last_row - beginning[0]
-        var first_column = last_column - beginning[1]
+        first_row = last_row - back_rows
+        var first_column = last_column - back_columns
 
         path_columns[last_row] = Int32(last_column)
         var core_columns = List[Int32](length=len(left) + 1, fill=Int32(0))
@@ -2507,14 +2564,26 @@ def smith_waterman_gotoh_alignment_linear(
             core_columns[index] = path_columns[index]
             core_entries[index] = path_entries[index]
         hirschberg_window(
-            left, right, first_row, last_row, first_column, last_column,
-            substitutions, alphabet_size, scoring, cells, core_columns, core_entries,
+            left,
+            right,
+            first_row,
+            last_row,
+            first_column,
+            last_column,
+            substitutions,
+            alphabet_size,
+            scoring,
+            cells,
+            core_columns,
+            core_entries,
         )
         for index in range(first_row, last_row + 1):
             path_columns[index] = core_columns[index]
             path_entries[index] = core_entries[index]
 
-    var expanded = expand_path(left, right, path_columns, path_entries, alphabet, AlignmentMode.LOCAL, first_row, last_row)
+    var expanded = expand_path(
+        left, right, path_columns, path_entries, alphabet, AlignmentMode.LOCAL, first_row, last_row
+    )
     var triple = Python().list()
     triple.append(PythonObject(expanded[0]))
     triple.append(PythonObject(expanded[1]))
@@ -2526,11 +2595,11 @@ def device_local_extremum[
     half: SweepHalf
 ](
     ctx: DeviceContext,
-    sequences: List[Scalar[SYMBOL_DTYPE]],
+    sequences: ImmSpan[Scalar[SYMBOL_DTYPE], _],
     rows: Int,
     first_to: Int,
     second_to: Int,
-    substitutions: List[Scalar[SUBSTITUTION_DTYPE]],
+    substitutions: ImmSpan[Scalar[SUBSTITUTION_DTYPE], _],
     alphabet_size: Int,
     scoring: AffineGapCosts,
 ) raises -> Tuple[Int, Int, Int32]:
@@ -2574,9 +2643,7 @@ def smith_waterman_gotoh_alignment_linear_gpu(
     gaps: PythonObject,
 ) raises -> PythonObject:
     """Local alignment in linear space with every sweep running on the device."""
-    var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
-    var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gaps)
+    var alphabet, alphabet_size, scoring = protein_defaults(gaps)
     var substitutions = matrix_from(substitution, alphabet_size)
     var cells = DEFAULT_TILE_CELLS
     var left = translate(String(first), alphabet)
@@ -2587,33 +2654,55 @@ def smith_waterman_gotoh_alignment_linear_gpu(
     sequences.extend(Span(right))
 
     var ctx = DeviceContext()
-    var ending = device_local_extremum[SweepHalf.FORWARD](
-        ctx, sequences, len(left), len(left), len(right),
-        substitutions, alphabet_size, scoring,
+    var last_row, last_column, score = device_local_extremum[SweepHalf.FORWARD](
+        ctx,
+        sequences,
+        len(left),
+        len(left),
+        len(right),
+        substitutions,
+        alphabet_size,
+        scoring,
     )
-    var last_row = ending[0]
-    var last_column = ending[1]
-    var score = ending[2]
 
     var path_columns = List[Int32](length=len(left) + 1, fill=Int32(0))
     var path_entries = List[Layer](length=len(left) + 1, fill=Layer.ALIGNING)
 
     var first_row = last_row
     if score > 0:
-        var beginning = device_local_extremum[SweepHalf.REVERSE](
-            ctx, sequences, len(left), last_row, last_column,
-            substitutions, alphabet_size, scoring,
+        var back_rows, back_columns, _ = device_local_extremum[SweepHalf.REVERSE](
+            ctx,
+            sequences,
+            len(left),
+            last_row,
+            last_column,
+            substitutions,
+            alphabet_size,
+            scoring,
         )
-        first_row = last_row - beginning[0]
-        var first_column = last_column - beginning[1]
+        first_row = last_row - back_rows
+        var first_column = last_column - back_columns
 
         path_columns[last_row] = Int32(last_column)
         hirschberg_path_gpu(
-            ctx, left, right, first_row, last_row, first_column, last_column,
-            substitutions, alphabet_size, scoring, cells, path_columns, path_entries,
+            ctx,
+            left,
+            right,
+            first_row,
+            last_row,
+            first_column,
+            last_column,
+            substitutions,
+            alphabet_size,
+            scoring,
+            cells,
+            path_columns,
+            path_entries,
         )
 
-    var expanded = expand_path(left, right, path_columns, path_entries, alphabet, AlignmentMode.LOCAL, first_row, last_row)
+    var expanded = expand_path(
+        left, right, path_columns, path_entries, alphabet, AlignmentMode.LOCAL, first_row, last_row
+    )
     var triple = Python().list()
     triple.append(PythonObject(expanded[0]))
     triple.append(PythonObject(expanded[1]))
@@ -2669,28 +2758,17 @@ def gotoh_scores(
     """Scores every pair. The score kernels are two-row, so linear space is the only space."""
     var requested = mode_from(mode)
     if executor_from(device) == Executor.DEVICE:
-        if requested == AlignmentMode.LOCAL:
-            return gotoh_scores_batch[AlignmentMode.LOCAL](
-                firsts, seconds, substitution, gaps
-            )
-        return gotoh_scores_batch[AlignmentMode.GLOBAL](
-            firsts, seconds, substitution, gaps
-        )
+        comptime for index in range(len(ALL_MODES)):
+            comptime candidate = ALL_MODES[index]
+            if requested == candidate:
+                return gotoh_scores_batch[candidate](firsts, seconds, substitution, gaps)
 
     var results = Python().list()
     for index in range(paired_length(firsts, seconds)):
-        if requested == AlignmentMode.LOCAL:
-            results.append(
-                gotoh_score[AlignmentMode.LOCAL](
-                    firsts[index], seconds[index], substitution, gaps
-                )
-            )
-        else:
-            results.append(
-                gotoh_score[AlignmentMode.GLOBAL](
-                    firsts[index], seconds[index], substitution, gaps
-                )
-            )
+        comptime for choice in range(len(ALL_MODES)):
+            comptime candidate = ALL_MODES[choice]
+            if requested == candidate:
+                results.append(gotoh_score[candidate](firsts[index], seconds[index], substitution, gaps))
     return results
 
 
@@ -2708,19 +2786,11 @@ def align_pair(
     if cells > stored_budget:
         if executor == Executor.DEVICE:
             if mode == AlignmentMode.LOCAL:
-                return smith_waterman_gotoh_alignment_linear_gpu(
-                    first, second, substitution, gaps
-                )
-            return needleman_wunsch_gotoh_alignment_linear_gpu(
-                first, second, substitution, gaps
-            )
+                return smith_waterman_gotoh_alignment_linear_gpu(first, second, substitution, gaps)
+            return needleman_wunsch_gotoh_alignment_linear_gpu(first, second, substitution, gaps)
         if mode == AlignmentMode.LOCAL:
-            return smith_waterman_gotoh_alignment_linear(
-                first, second, substitution, gaps
-            )
-        return needleman_wunsch_gotoh_alignment_linear(
-            first, second, substitution, gaps
-        )
+            return smith_waterman_gotoh_alignment_linear(first, second, substitution, gaps)
+        return needleman_wunsch_gotoh_alignment_linear(first, second, substitution, gaps)
 
     if executor == Executor.DEVICE:
         # No single-pair device entry exists for the stored traceback, so this is a batch of one.
@@ -2728,21 +2798,16 @@ def align_pair(
         var rights = Python().list()
         lefts.append(first)
         rights.append(second)
-        if mode == AlignmentMode.LOCAL:
-            return gotoh_alignments_batch[AlignmentMode.LOCAL](
-                lefts, rights, substitution, gaps
-            )[0]
-        return gotoh_alignments_batch[AlignmentMode.GLOBAL](
-            lefts, rights, substitution, gaps
-        )[0]
+        comptime for index in range(len(ALL_MODES)):
+            comptime candidate = ALL_MODES[index]
+            if mode == candidate:
+                return gotoh_alignments_batch[candidate](lefts, rights, substitution, gaps)[0]
 
-    if mode == AlignmentMode.LOCAL:
-        return gotoh_alignment[AlignmentMode.LOCAL](
-            first, second, substitution, gaps
-        )
-    return gotoh_alignment[AlignmentMode.GLOBAL](
-        first, second, substitution, gaps
-    )
+    comptime for index in range(len(ALL_MODES)):
+        comptime candidate = ALL_MODES[index]
+        if mode == candidate:
+            return gotoh_alignment[candidate](first, second, substitution, gaps)
+    raise Error("Unhandled alignment mode.")
 
 
 def gotoh_alignments(
@@ -2771,20 +2836,22 @@ def gotoh_alignments(
             widest = cells
 
     if executor == Executor.DEVICE and widest <= budget and pairs > 0:
-        if requested == AlignmentMode.LOCAL:
-            return gotoh_alignments_batch[AlignmentMode.LOCAL](
-                firsts, seconds, substitution, gaps
-            )
-        return gotoh_alignments_batch[AlignmentMode.GLOBAL](
-            firsts, seconds, substitution, gaps
-        )
+        comptime for index in range(len(ALL_MODES)):
+            comptime candidate = ALL_MODES[index]
+            if requested == candidate:
+                return gotoh_alignments_batch[candidate](firsts, seconds, substitution, gaps)
 
     var results = Python().list()
     for index in range(pairs):
         results.append(
             align_pair(
-                firsts[index], seconds[index], requested, executor, budget,
-                substitution, gaps,
+                firsts[index],
+                seconds[index],
+                requested,
+                executor,
+                budget,
+                substitution,
+                gaps,
             )
         )
     return results
@@ -2802,9 +2869,11 @@ def PyInit_affinegaps_mojo() abi("C") -> PythonObject:
     except error:
         abort(String("Failed to initialize affinegaps_mojo: ", error))
 
+
 # endregion Python Bindings
 
 # region Command Line
+
 
 def parse_int(text: String) -> Optional[Int]:
     """Reads a command-line integer, returning nothing when the text is not one."""
@@ -2824,11 +2893,13 @@ def main() raises:
     var arguments = argv()
     var count = len(arguments)
     if count < 3 or String(arguments[1]) == "--help" or String(arguments[1]) == "-h":
-        print("Usage: affinegaps FIRST SECOND [--local] [--gpu]")
-        print("                  [--match N] [--mismatch N]")
-        print("                  [--open N] [--extend N] [--help]")
-        print()
-        print("Gotoh affine-gap alignment. Reconstructs the alignment, not just the score.")
+        print(
+            """Usage: affinegaps FIRST SECOND [--local] [--gpu]
+                  [--match N] [--mismatch N]
+                  [--open N] [--extend N] [--help]
+
+Gotoh affine-gap alignment. Reconstructs the alignment, not just the score."""
+        )
         return
 
     var first = String(arguments[1])
@@ -2876,21 +2947,22 @@ def main() raises:
 
     var result: AlignmentResult
     if local:
-        result = serial_align[AlignmentMode.LOCAL](
-            left, right, substitutions, alphabet_size, scoring, alphabet
-        )
+        result = serial_align[AlignmentMode.LOCAL](left, right, substitutions, alphabet_size, scoring, alphabet)
     else:
-        result = serial_align[AlignmentMode.GLOBAL](
-            left, right, substitutions, alphabet_size, scoring, alphabet
-        )
+        result = serial_align[AlignmentMode.GLOBAL](left, right, substitutions, alphabet_size, scoring, alphabet)
 
     var painted = colorize(result.first_gapped, result.second_gapped)
-    print()
-    print("Sequence 1:", first)
-    print("Sequence 2:", second)
-    print()
-    print("Alignment 1:", painted[0])
-    print("Alignment 2:", painted[1])
-    print("Score:      ", result.score)
+    print(
+        """
+Sequence 1:  {}
+Sequence 2:  {}
+
+Alignment 1: {}
+Alignment 2: {}
+Score:       {}""".format(
+            first, second, painted[0], painted[1], result.score
+        )
+    )
+
 
 # endregion Command Line
