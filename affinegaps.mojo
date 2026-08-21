@@ -5,21 +5,17 @@ Gotoh affine-gap sequence alignment with the alignment reconstruction itself run
 the GPU, in linear space. The scoring recurrences, the tie-breaking and the border
 initialization are transcribed from `affinegaps.py`, which stays the parity oracle.
 
-The Python and NumBa kernels sweep the dynamic-programming matrix row by row, which is the
-wrong axis for a GPU: the insertion term of a cell reads the insertion term of its left
-neighbour in the same row, so a row is a serial scan. This module sweeps anti-diagonals,
-where every cell of `d = i + j` reads only `d - 1` and `d - 2` and the whole diagonal is
-independent.
+A row is the wrong sweep axis for a GPU, because the insertion term of a cell reads the
+insertion term of its left neighbour. This module sweeps anti-diagonals instead, where every
+cell of `d = i + j` reads only `d - 1` and `d - 2` and the whole diagonal is independent.
 
 Traceback is Hirschberg with a Myers-Miller affine join, splitting on rows rather than
-anti-diagonals: a substitution step advances `i + j` by two and can skip a diagonal
-entirely, while the row index advances by exactly zero or one per step. The recursion
-bottoms out in a direct traceback over a stored decision tile, which is the same code path the
-linear-space mode uses for its leaves.
+anti-diagonals: a substitution step advances `i + j` by two and can skip a diagonal entirely,
+while the row index advances by zero or one per step. The recursion bottoms out in a direct
+traceback over a stored decision tile.
 
-Scores match `affinegaps.py` exactly. The traceback walks all three layers — match, deletion and
-insertion — so every path it returns realizes the score reported alongside it, which is what a
-reader of the output would assume and is not automatic for affine gaps.
+The traceback walks all three layers — match, deletion and insertion — so every path realizes
+the score reported alongside it, which is not automatic for affine gaps.
 
 For score-only work at much higher throughput, see `ashvardanian/StringZilla`, whose
 `stringzillas/similarities` kernels compute the same distances and scores. It carries no
@@ -28,8 +24,8 @@ traceback, which is what this module exists to provide.
 ## Usage
 
 ```bash
-pixi run build                      # build/affinegaps_mojo.so, importable from Python
-pixi run test                       # the differential suite against affinegaps.py
+pixi run build      # build/affinegaps_mojo.so, importable from Python
+pixi run test       # the differential suite against affinegaps.py
 ```
 """
 

@@ -82,10 +82,10 @@ A downstream [pixi](https://pixi.sh) project takes the same git dependency, pinn
 pixi add --pypi 'affinegaps @ git+https://github.com/unum-bio/AffineGaps.git'
 ```
 
-To try it without installing anything at all:
+To run the tool once without installing anything, `uvx` fetches, builds and runs it in a throwaway environment:
 
 ```bash
-pixi exec --spec python=3.12 --spec numpy -- affinegaps GATTACA GACTATA
+uvx --from git+https://github.com/unum-bio/AffineGaps.git affinegaps GATTACA GACTATA
 ```
 
 ### Requirements for the GPU

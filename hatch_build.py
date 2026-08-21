@@ -46,9 +46,7 @@ class MojoExtensionHook(BuildHookInterface):
         for library in bundled:
             self._repoint(library)
             build_data["force_include"][str(library)] = library.name
-        # The extension links no libpython — it resolves nothing from the interpreter — so one
-        # artifact serves every Python version and the tag must say `py3` rather than a `cp3xx`
-        # that would refuse to install on the next release.
+        # The extension links no libpython, so one artifact serves every Python version.
         build_data["tag"] = f"py3-none-{self._platform_tag()}"
         build_data["pure_python"] = False
 

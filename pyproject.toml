@@ -1,9 +1,13 @@
 [build-system]
 build-backend = "hatchling.build"
-# `mojo` compiles the kernels and `max` carries the GPU host types they import; `patchelf`
-# repoints the result at the wheel. None can be conditioned on an extra, so every install pays
-# roughly 125 MB for them; where Mojo ships no wheel the hook emits the pure-Python one instead.
-requires = ["hatchling", "packaging", "mojo>=1.0,<2", "max>=26.5,<27", "patchelf>=0.17; sys_platform == 'linux'"]
+# `max` carries the compiler and the GPU host types; `patchelf` repoints the result at the wheel.
+# The markers match the platforms Modular ships wheels for; elsewhere the hook emits pure Python.
+requires = [
+  "hatchling",
+  "packaging",
+  "max>=26.5,<27; (sys_platform == 'linux' and platform_machine in 'x86_64 aarch64') or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+  "patchelf>=0.17; sys_platform == 'linux'",
+]
 
 [project]
 authors = [
@@ -31,10 +35,6 @@ version = "0.2.5"
 Homepage = "https://github.com/unum-bio/AffineGaps"
 Repository = "https://github.com/unum-bio/AffineGaps.git"
 
-# One optional extra, not two overlapping ones: `numba` used to omit `colorama`, so anyone
-# following the README lost coloured output without being told.
-# Named for what they deliver. `jit` used to mean Numba while bundling terminal colour, which
-# became ambiguous once the project gained a second compiler.
 [project.optional-dependencies]
 color = ["colorama"]
 numba = ["numba"]
@@ -47,11 +47,9 @@ test = ["biopython", "stringzilla", "pytest", "pytest-repeat"]
 [tool.pytest.ini_options]
 addopts = "-q" # no -x: with a backend axis, every backend's failure matters
 
-# Configuration options for the Black formatter:
-# https://black.readthedocs.io/en/latest/usage_and_configuration/the_basics.html#where-black-looks-for-the-file
 [tool.black]
-line-length = 120 # Set line length to the same value as in `.clang-format` for modern wide screens
-target-version = ['py312'] 
+line-length = 120
+target-version = ['py312']
 
 [tool.ruff]
 line-length = 120
@@ -61,9 +59,9 @@ target-version = "py312"
 select = ["E", "F", "W", "B", "UP", "SIM", "RUF"]
 
 [tool.mypy]
-files = ["affinegaps.py"] 
+files = ["affinegaps.py"]
 ignore_missing_imports = true # NumBa and colorama are optional at runtime
-python_version = "3.12" 
+python_version = "3.12"
 
 # Without an explicit target hatchling sweeps the Mojo sources and the test file into the sdist.
 [tool.hatch.build.targets.sdist]

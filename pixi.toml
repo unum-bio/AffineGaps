@@ -5,7 +5,7 @@ description = "Needleman-Wunsch and Smith-Waterman with affine gaps, scoring and
 license = "Apache-2.0"
 license-file = "LICENSE"
 name = "affinegaps"
-platforms = ["linux-64"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 readme = "README.md"
 version = "0.2.5"
 
@@ -22,13 +22,10 @@ pytest-repeat = "*"
 stringzilla = "*"
 
 [tasks]
-# `main` and the library share one source file, and Mojo refuses to emit a shared library from a
-# file that defines `main`, so the extension is compiled from a copy with that region stripped.
+# Mojo refuses to emit a shared library from a file defining `main`, so the region is stripped first.
 build = "python scripts/build_extension.py"
 build-cli = "mojo build affinegaps.mojo -o build/affinegaps"
 test = {cmd = "pytest test.py", depends-on = ["build"]}
 
-# Puts the `affinegaps` command on the PATH, compiled kernels included. `pixi global install --git`
-# cannot serve this repository, because it reads `pyproject.toml` and requires `[tool.pixi.*]`
-# tables that would duplicate this manifest.
-install = {cmd = "uv tool install --force --with-editable . .", depends-on = ["build"]}
+# The build hook compiles the kernels into the wheel, so this needs no `build` step of its own.
+install = "uv tool install --force ."

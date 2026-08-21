@@ -42,8 +42,7 @@ jobs:
             affinegaps.py:^__version__ = "(\d+\.\d+\.\d+)"
           dry-run: "true"
 
-  # Gates the matrix below. A formatting or typing break is the same on every interpreter, so
-  # finding it once on the oldest supported one beats finding it three times in parallel.
+  # Gates the matrix below: a formatting or typing break is the same on every interpreter.
   lint:
     name: Static Analysis
     runs-on: ubuntu-24.04
@@ -67,11 +66,7 @@ jobs:
       - name: Types
         run: mypy
 
-  # A hosted runner has no GPU, so this compiles and does not execute. It exists because nothing
-  # else in CI touches the Mojo half, so a compile break would otherwise reach `main` unnoticed.
-  # Hosted runners have no GPU, so this compiles and does not execute. Mojo ships wheels for
-  # Linux on x86-64 and ARM and for macOS on Apple silicon, so all three are built rather than
-  # one being built and three being claimed.
+  # A hosted runner has no GPU, so this compiles without executing, on all three Mojo platforms.
   build_mojo:
     name: Mojo Compiles (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
