@@ -44,7 +44,10 @@ Author: Ash Vardanian
 License: Apache 2.0
 """
 
-from typing import Literal
+import os
+import sys
+from functools import cache, lru_cache
+from typing import Any, Literal, cast
 from collections.abc import Callable
 
 import numpy as np
@@ -58,6 +61,171 @@ except ImportError:
     HAS_NUMBA = False
 
 __version__ = "0.2.5"
+
+
+# region Backends
+
+# Above this many cells the stored decision matrix stops being affordable, and the traceback
+# switches to the linear-space recursion. Both produce identical output, so this is purely a
+# memory-versus-recomputation trade. Five matrices at seventeen bytes a cell keeps it near 100 MB.
+_STORED_MATRIX_BUDGET = 6_000_000
+
+# Which compiled entry point serves each combination. The batched device functions take parallel
+# lists and return one result per pair, which the caller unwraps.
+_COMPILED_SUFFIX = {("mojo", "cpu"): "", ("mojo", "gpu"): "s_gpu"}
+
+
+@lru_cache(maxsize=1)
+def _mojo_backend():
+    """Imports the compiled module, looking in the local build directory as a fallback.
+
+    Keeping this in one place means callers never manipulate `sys.path` themselves, and a project
+    checkout behaves the same as an installed package.
+    """
+    try:
+        import affinegaps_mojo
+    except ImportError:
+        build = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build")
+        if build not in sys.path:
+            sys.path.insert(0, build)
+        try:
+            import affinegaps_mojo
+        except ImportError:
+            return None
+    return affinegaps_mojo
+
+
+@cache
+def available(backend: str = "mojo", device: str = "cpu") -> bool:
+    """Whether a backend and device combination actually runs, tried once and remembered.
+
+    This executes a tiny alignment rather than inferring from an import, because a built extension
+    on a machine with an unsupported driver imports cleanly and then fails at every device call.
+    """
+    if backend == "numpy":
+        return device == "cpu"
+    if _mojo_backend() is None:
+        return False
+    try:
+        needleman_wunsch_gotoh_score("AR", "RA", backend=cast(Any, backend), device=cast(Any, device))
+    except Exception:
+        return False
+    return True
+
+
+def _resolve(backend, device):
+    """Validates a backend and device pair, filling in whichever the caller left unspecified.
+
+    Unspecified adapts to the machine; specified is honoured or refused. Falling back silently
+    would let a benchmark report the GPU while measuring the reference.
+    """
+    if backend is None and device is None:
+        for candidate in (("mojo", "gpu"), ("mojo", "cpu")):
+            if available(*candidate):
+                return candidate
+        return ("numpy", "cpu")
+    if backend is None:
+        backend = "numpy" if device == "cpu" and not available("mojo", "cpu") else "mojo"
+    if device is None:
+        device = "gpu" if backend == "mojo" and available("mojo", "gpu") else "cpu"
+
+    if backend == "numpy":
+        if device != "cpu":
+            raise ValueError("The NumPy backend runs on the CPU only")
+        return (backend, device)
+    if (backend, device) not in _COMPILED_SUFFIX:
+        raise ValueError(f"Unknown backend {backend!r} or device {device!r}")
+    if _mojo_backend() is None:
+        raise RuntimeError("The Mojo backend is not built. See the README for how to build it.")
+    return (backend, device)
+
+
+def _custom_scoring(substitution_alphabet, substitution_matrix) -> bool:
+    """Whether the caller supplied a table the compiled backend does not carry.
+
+    Passing the defaults explicitly is not custom, which is what lets a caller name the alphabet
+    for readability without being pushed off the compiled path.
+    """
+    if substitution_alphabet is not None and substitution_alphabet != default_proteins_alphabet:
+        return True
+    if substitution_matrix is None:
+        return False
+    return not np.array_equal(substitution_matrix, default_proteins_matrix)
+
+
+def _compiled_call(name, backend, device, first, second, options):
+    """Routes one pair to the compiled backend, choosing the entry point and unwrapping the result."""
+    if _custom_scoring(options.get("substitution_alphabet"), options.get("substitution_matrix")):
+        raise NotImplementedError(f"{name} on the {backend} backend needs match/mismatch or the default matrix")
+
+    scoring_only = name.endswith("_score")
+    suffix = _COMPILED_SUFFIX[(backend, device)]
+    opening = options.get("gap_opening")
+    extension = options.get("gap_extension")
+
+    if not scoring_only and len(first) * len(second) > _STORED_MATRIX_BUDGET:
+        # Too large to store a decision per cell, so take the linear-space traceback. Its entry
+        # points need concrete penalties rather than the None sentinel.
+        suffix = "_linear_gpu" if device == "gpu" else "_linear"
+        opening = default_gap_opening if opening is None else opening
+        extension = default_gap_extension if extension is None else extension
+
+    entry = getattr(_mojo_backend(), name + suffix)
+    arguments = (opening, extension, options.get("match"), options.get("mismatch"))
+    # The batched device entry points take parallel lists and return one result per pair.
+    outcome = entry([first], [second], *arguments)[0] if suffix == "s_gpu" else entry(first, second, *arguments)
+    return outcome if scoring_only else tuple(outcome)
+
+
+def _compiled_batch(name, backend, device, firsts, seconds, options):
+    """Routes a whole batch, which is what the device is for."""
+    if _custom_scoring(options.get("substitution_alphabet"), options.get("substitution_matrix")):
+        raise NotImplementedError(f"{name} on the {backend} backend needs match/mismatch or the default matrix")
+    entry = getattr(_mojo_backend(), name + _COMPILED_SUFFIX[(backend, device)])
+    outcome = entry(
+        list(firsts),
+        list(seconds),
+        options.get("gap_opening"),
+        options.get("gap_extension"),
+        options.get("match"),
+        options.get("mismatch"),
+    )
+    return [row if name.endswith("_score") else tuple(row) for row in outcome]
+
+
+def _batch(name, backend, device, firsts, seconds, **options):
+    """One batch entry point, on whichever backend resolves."""
+    backend, device = _resolve(backend, device)
+    if backend == "numpy":
+        single = globals()[name]
+        return [single(a, b, **options) for a, b in zip(firsts, seconds, strict=True)]
+    if device == "cpu":
+        single = globals()[name]
+        return [single(a, b, backend=backend, device=device, **options) for a, b in zip(firsts, seconds, strict=True)]
+    return _compiled_batch(name, backend, device, firsts, seconds, options)
+
+
+def needleman_wunsch_gotoh_alignments(firsts, seconds, *, backend=None, device=None, **options):
+    """Globally aligns a whole batch, one thread block per pair on the device."""
+    return _batch("needleman_wunsch_gotoh_alignment", backend, device, firsts, seconds, **options)
+
+
+def smith_waterman_gotoh_alignments(firsts, seconds, *, backend=None, device=None, **options):
+    """Locally aligns a whole batch, one thread block per pair on the device."""
+    return _batch("smith_waterman_gotoh_alignment", backend, device, firsts, seconds, **options)
+
+
+def needleman_wunsch_gotoh_scores(firsts, seconds, *, backend=None, device=None, **options):
+    """Scores a whole batch globally, without reconstructing the alignments."""
+    return _batch("needleman_wunsch_gotoh_score", backend, device, firsts, seconds, **options)
+
+
+def smith_waterman_gotoh_scores(firsts, seconds, *, backend=None, device=None, **options):
+    """Scores a whole batch locally, without reconstructing the alignments."""
+    return _batch("smith_waterman_gotoh_score", backend, device, firsts, seconds, **options)
+
+
+# endregion Backends
 
 
 # Define decorator to handle optional NumBa
@@ -435,6 +603,9 @@ def needleman_wunsch_gotoh_alignment(
     gap_extension: int | None = None,
     match: int | None = None,
     mismatch: int | None = None,
+    *,
+    backend: Literal["numpy", "mojo"] | None = None,
+    device: Literal["cpu", "gpu"] | None = None,
 ) -> tuple[str, str, int]:
     """
     Aligns two sequences using Gotoh's affine gap penalty extensions for the
@@ -468,6 +639,24 @@ def needleman_wunsch_gotoh_alignment(
     >>> print("Alignment 2:", align2)
     >>> print("Score:", score)
     """
+    backend, device = _resolve(backend, device)
+    if backend != "numpy":
+        return _compiled_call(
+            "needleman_wunsch_gotoh_alignment",
+            backend,
+            device,
+            str1,
+            str2,
+            dict(
+                substitution_alphabet=substitution_alphabet,
+                substitution_matrix=substitution_matrix,
+                gap_opening=gap_opening,
+                gap_extension=gap_extension,
+                match=match,
+                mismatch=mismatch,
+            ),
+        )
+
     substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
         substitution_alphabet=substitution_alphabet,
         substitution_matrix=substitution_matrix,
@@ -503,7 +692,7 @@ def needleman_wunsch_gotoh_alignment(
 
 
 @jit_if_available(nopython=True)
-def needleman_wunsch_gotoh_score_kernel(
+def _needleman_wunsch_gotoh_score_kernel(
     seq1: np.ndarray,
     seq2: np.ndarray,
     substitution_matrix: np.ndarray,
@@ -581,6 +770,9 @@ def needleman_wunsch_gotoh_score(
     gap_extension: int | None = None,
     match: int | None = None,
     mismatch: int | None = None,
+    *,
+    backend: Literal["numpy", "mojo"] | None = None,
+    device: Literal["cpu", "gpu"] | None = None,
 ) -> int:
     """
     Measures the alignment score of two sequences using Gotoh's affine gap penalty extensions for the
@@ -614,6 +806,23 @@ def needleman_wunsch_gotoh_score(
     >>> print("Alignment 2:", align2)
     >>> print("Score:", score)
     """
+    backend, device = _resolve(backend, device)
+    if backend != "numpy":
+        return _compiled_call(
+            "needleman_wunsch_gotoh_score",
+            backend,
+            device,
+            str1,
+            str2,
+            dict(
+                substitution_alphabet=substitution_alphabet,
+                substitution_matrix=substitution_matrix,
+                gap_opening=gap_opening,
+                gap_extension=gap_extension,
+                match=match,
+                mismatch=mismatch,
+            ),
+        )
 
     # The inner loop must be the longer one, assuming the latency of calls
     # from Python into the C layer implementation of NumPy, so lets swap
@@ -634,7 +843,7 @@ def needleman_wunsch_gotoh_score(
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
 
-    score = needleman_wunsch_gotoh_score_kernel(
+    score = _needleman_wunsch_gotoh_score_kernel(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
@@ -784,6 +993,9 @@ def smith_waterman_gotoh_alignment(
     gap_extension: int | None = None,
     match: int | None = None,
     mismatch: int | None = None,
+    *,
+    backend: Literal["numpy", "mojo"] | None = None,
+    device: Literal["cpu", "gpu"] | None = None,
 ) -> tuple[str, str, int]:
     """
     Aligns two sequences using the Smith-Waterman algorithm for local alignment.
@@ -801,6 +1013,24 @@ def smith_waterman_gotoh_alignment(
     Returns:
     Tuple[str, str, int]: The optimal local alignment of the two sequences and the alignment score.
     """
+    backend, device = _resolve(backend, device)
+    if backend != "numpy":
+        return _compiled_call(
+            "smith_waterman_gotoh_alignment",
+            backend,
+            device,
+            str1,
+            str2,
+            dict(
+                substitution_alphabet=substitution_alphabet,
+                substitution_matrix=substitution_matrix,
+                gap_opening=gap_opening,
+                gap_extension=gap_extension,
+                match=match,
+                mismatch=mismatch,
+            ),
+        )
+
     substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
         substitution_alphabet=substitution_alphabet,
         substitution_matrix=substitution_matrix,
@@ -838,7 +1068,7 @@ def smith_waterman_gotoh_alignment(
 
 
 @jit_if_available(nopython=True)
-def smith_waterman_gotoh_score_kernel(
+def _smith_waterman_gotoh_score_kernel(
     seq1: np.ndarray,
     seq2: np.ndarray,
     substitution_matrix: np.ndarray,
@@ -914,6 +1144,9 @@ def smith_waterman_gotoh_score(
     gap_extension: int | None = None,
     match: int | None = None,
     mismatch: int | None = None,
+    *,
+    backend: Literal["numpy", "mojo"] | None = None,
+    device: Literal["cpu", "gpu"] | None = None,
 ) -> int:
     """
     Measures the Smith-Waterman local alignment score using Gotoh's affine gap penalty extensions.
@@ -938,6 +1171,23 @@ def smith_waterman_gotoh_score(
     >>> score = smith_waterman_gotoh_score(str1, str2)
     >>> print("Score:", score)
     """
+    backend, device = _resolve(backend, device)
+    if backend != "numpy":
+        return _compiled_call(
+            "smith_waterman_gotoh_score",
+            backend,
+            device,
+            str1,
+            str2,
+            dict(
+                substitution_alphabet=substitution_alphabet,
+                substitution_matrix=substitution_matrix,
+                gap_opening=gap_opening,
+                gap_extension=gap_extension,
+                match=match,
+                mismatch=mismatch,
+            ),
+        )
 
     substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
         substitution_alphabet=substitution_alphabet,
@@ -951,7 +1201,7 @@ def smith_waterman_gotoh_score(
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
 
-    score = smith_waterman_gotoh_score_kernel(
+    score = _smith_waterman_gotoh_score_kernel(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
@@ -1047,19 +1297,19 @@ def main():
         help=f"The penalty for extending a gap; uses {default_gap_extension} by default",
     )
     parser.add_argument(
-        "--substitution-path",
-        type=str,
-        default=None,
-        help="The path to the substitution alphabet and costs matrix file",
-    )
-    parser.add_argument(
         "--local",
         action="store_true",
         help="Use the Smith-Waterman algorithm for local alignment instead of Needleman-Wunsch",
     )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Align on the GPU, which needs the compiled backend",
+    )
     args = parser.parse_args()
 
     aligner = smith_waterman_gotoh_alignment if args.local else needleman_wunsch_gotoh_alignment
+    placement = {"backend": "mojo", "device": "gpu"} if args.gpu else {}
     try:
         align1, align2, score = aligner(
             args.seq1,
@@ -1068,6 +1318,7 @@ def main():
             mismatch=args.mismatch,
             gap_opening=args.gap_opening,
             gap_extension=args.gap_extension,
+            **placement,
         )
     except Exception as exc:
         print("Error:", exc)

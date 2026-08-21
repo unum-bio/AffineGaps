@@ -2,15 +2,15 @@
 
 ![Affine Gaps Thumbnail](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/AffineGaps.jpg?raw=true)
 
-__Affine Gaps__ is a __less-wrong__ single-file Numba-accelerated Python implementation of Osamu Gotoh affine gap penalty extensions 1982 [paper](https://doc.aporc.org/attach/Course001Papers/gotoh1982.pdf) for the Needleman-Wunsch and Smith-Waterman algorithms often used for global and local sequence alignment in Bioinformatics.
-Thanks to the Numba JIT compiler, it's also competitive in terms of performance.
-But if you want to go even faster and need more hardware-accelerated string operations, check out [StringZilla](https://github.com/ashvardanian/stringzilla) 🦖
+__Affine Gaps__ is a __less-wrong__ implementation of Osamu Gotoh affine gap penalty extensions 1982 [paper](https://doc.aporc.org/attach/Course001Papers/gotoh1982.pdf) for the Needleman-Wunsch and Smith-Waterman algorithms often used for global and local sequence alignment in Bioinformatics.
+Unlike the fast aligners, it doesn't stop at the score — it reconstructs the alignment itself, __on the GPU, in linear memory__.
+A NumPy reference implementation ships beside the Mojo kernels and serves as the parity oracle.
 
 ## Less Wrong
 
 As reported in the "Are all global alignment algorithms and implementations correct?" [paper](https://www.biorxiv.org/content/10.1101/031500v1.full.pdf) by Tomas Flouri, Kassian Kobert, Torbjørn Rognes, and Alexandros Stamatakis:
 
-> In 1982 Gotoh presented an improved algorithm with lower time complexity. 
+> In 1982 Gotoh presented an improved algorithm with lower time complexity.
 > Gotoh’s algorithm is frequently cited...
 > While implementing the algorithm, we discovered two mathematical mistakes in Gotoh’s paper that induce sub-optimal sequence alignments.
 > First, there are minor indexing mistakes in the dynamic programming algorithm which become apparent immediately when implementing the procedure.
@@ -23,29 +23,75 @@ As reported in the "Are all global alignment algorithms and implementations corr
 > We found that 8 out of 31 lecture slides contained the mistake, while 16 out of 31 simply omit parts of the initialization, thus giving an incomplete description of the algorithm.
 > Finally, by inspecting ten source codes and running respective tests, we found that five implementations were incorrect.
 
-During my exploration of exiting implementations, I've noticed several bugs:
+During my exploration of existing implementations, I've noticed several bugs:
 
 - several libraries initialize the header row/columns of penalty matrices with ±∞, causing overflows on the first iteration.
 - initialize matrices to zeros, ignoring the first gap opening cost.
 - combining opening and expansion costs where only the opening cost should be applied.
 - even the most correct `needle` from EMBOSS uses `float` representation, which would obviously be numerically unstable on very long sequences.
 
+### When to Use StringZilla Instead
+
+Reconstruction is what this project is for; raw scoring throughput is not.
+If you only need a score or a distance, [`ashvardanian/StringZilla`](https://github.com/ashvardanian/StringZilla) computes the same Levenshtein, Needleman-Wunsch and Smith-Waterman values far faster — its `stringzillas/similarities` kernels report 5910, 711 and 616 GCUPS on an H100 using bit-parallel Myers, Hopper DPX fused min/max, and 128x128 register micro-tiles.
+It carries no traceback in any backend, which is precisely the gap this module fills.
+
 ## Installation
 
-Numba is optional.
-Installing without it gives a pure-Python baseline; installing with the `numba` extra enables JIT acceleration when a compatible Numba is available.
+There is no package-registry release; the repository is the distribution.
+Where Mojo ships a toolchain — Linux on x86-64 or ARM, and macOS on Apple silicon — the compiled kernels are built during the install and travel with the package.
+Everywhere else you get the NumPy reference alone, from the same command.
 
-```sh
-uv pip install affinegaps          # minimal
-uv pip install 'affinegaps[numba]' # with JIT
+```bash
+uv pip install git+https://github.com/unum-bio/AffineGaps.git
+uv pip install 'affinegaps[numba] @ git+https://github.com/unum-bio/AffineGaps.git'
 ```
 
-Even without installing Python or touching PyPi, you can just use `uv` to get the latest version of the library:
+Pin a tag or a commit when the build has to be reproducible:
+
+```bash
+uv pip install 'affinegaps @ git+https://github.com/unum-bio/AffineGaps.git@v0.2.5'
+```
+
+Two optional extras, neither of them required: `numba` accelerates the NumPy reference, and `color` paints the command-line output.
+
+### The Command-Line Tool
+
+`uv tool install` puts `affinegaps` on your path without touching the current environment:
 
 ```bash
 $ uv tool install git+https://github.com/unum-bio/AffineGaps.git
-$ affinegaps --help
+$ affinegaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV --local
 ```
+
+The same tool is also built natively from a checkout, with no Python involved at run time:
+
+```bash
+git clone https://github.com/unum-bio/AffineGaps.git && cd AffineGaps
+pixi run install      # `affinegaps` on the PATH, compiled kernels included
+pixi run build-cli    # or build/affinegaps, a standalone binary
+```
+
+Both accept the same flags and print the same thing, so install whichever suits you rather than both.
+
+### As a Pixi Dependency
+
+A downstream [pixi](https://pixi.sh) project takes the same git dependency, pinned in `pixi.lock` beside everything else:
+
+```bash
+pixi add --pypi 'affinegaps @ git+https://github.com/unum-bio/AffineGaps.git'
+```
+
+To try it without installing anything at all:
+
+```bash
+pixi exec --spec python=3.12 --spec numpy -- affinegaps GATTACA GACTATA
+```
+
+### Requirements for the GPU
+
+The compiled kernels run on the CPU anywhere Mojo builds them.
+Reaching the GPU additionally needs an NVIDIA device with driver 580 or newer, and `available("mojo", "gpu")` reports whether this machine has one — it tries a real alignment rather than assuming.
 
 ## Using the Library
 
@@ -56,35 +102,52 @@ from affinegaps import needleman_wunsch_gotoh_alignment
 
 insulin = "GIVEQCCTSICSLYQLENYCN"
 glucagon = "HSQGTFTSDYSKYLDSRAEQDFV"
-aligned_insulin, aligned_glucagon, aligned_score = needleman_wunsch_gotoh_alignment(insulin, glucagon)
+aligned_insulin, aligned_glucagon, score = needleman_wunsch_gotoh_alignment(insulin, glucagon)
 
-print("Alignment 1:", aligned_insulin)  # GI-V---EQCC-TSICSLY---QL-ENYCN-
-print("Alignment 2:", aligned_glucagon) # --D-FVHSQGTFTSDYSKYLDSRAEQDF--V
-print("Score:", aligned_score)          # 41
+print("Alignment 1:", aligned_insulin)  # ---GIVEQCCTSICSLY---QL-ENYCN-
+print("Alignment 2:", aligned_glucagon) # HSQGTF----TSDYSKYLDSRAEQDF--V
+print("Score:", score)                  # 22
 ```
 
-If you only need the alignment score, you can use the `needleman_wunsch_gotoh_score` function, which uses less memory and works faster.
+If you only need the alignment score, `needleman_wunsch_gotoh_score` uses less memory and works faster.
+
+The same call runs elsewhere by naming where the work goes.
+Two axes: `backend` chooses which implementation, `device` chooses which hardware.
+Naming neither picks the fastest the machine offers.
 
 ```python
-from affinegaps import needleman_wunsch_gotoh_score
-
-score = needleman_wunsch_gotoh_score(insulin, glucagon)
-
-print("Score:", score)
+needleman_wunsch_gotoh_alignment(insulin, glucagon)                            # fastest available
+needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="numpy")           # the reference
+needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="mojo")            # compiled, host
+needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="mojo", device="gpu")
 ```
 
-By default, a BLOSUM62 substitution matrix is used.
+Unspecified adapts; specified is honoured or refused.
+Asking for a backend that is not built raises rather than quietly running something else, so a measurement can never report the GPU while timing the reference.
+
+There is no knob for how the traceback stores its state.
+Below a size threshold it keeps a decision per cell, above it recurses in linear space, and the two produce identical output — so the choice is cost, never correctness.
+
+Batches are where the device earns its keep, one thread block per pair:
+
+```python
+from affinegaps import needleman_wunsch_gotoh_alignments, available
+
+if available("mojo", "gpu"):
+    results = needleman_wunsch_gotoh_alignments(firsts, seconds, backend="mojo", device="gpu")
+```
+
+By default a BLOSUM62 substitution matrix scaled by five is used.
 You can specify a different substitution matrix by passing it as an argument.
 
 ```python
-from numpy import np
+import numpy as np
 
 alphabet = "ARNDCQEGHILKMFPSTWYVBZX"
-substitutions = np.zeros((len(alphabet), len(alphabet)), dtype=np.int8)
-substitutions.fill(-1)
+substitutions = np.full((len(alphabet), len(alphabet)), -1, dtype=np.int8)
 np.fill_diagonal(substitutions, 1)
 
-aligned_insulin, aligned_glucagon, aligned_score = needleman_wunsch_gotoh_alignment(
+aligned_insulin, aligned_glucagon, score = needleman_wunsch_gotoh_alignment(
     insulin, glucagon,
     substitution_alphabet=alphabet,
     substitution_matrix=substitutions,
@@ -107,7 +170,7 @@ aligner.extend_gap_score = extend_gap_score
 
 ## Using the Command Line Interface
 
-To compute the optimal global alignment of insulin and glucagon sequences with (5x-scaled) BLOSUM62 substitution matrix through CLI:
+To compute the optimal global alignment of insulin and glucagon sequences with the BLOSUM62 substitution matrix scaled by five through CLI:
 
 ```bash
 $ affinegaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV
@@ -115,83 +178,25 @@ $ affinegaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV
 > Sequence 1: GIVEQCCTSICSLYQLENYCN
 > Sequence 2: HSQGTFTSDYSKYLDSRAEQDFV
 >
-> Alignment 1: GIVEQCCTSICSLY---QL-ENYCN-
-> Alignment 2: GTF----TSDYSKYLDSRAEQDF--V
+> Alignment 1: ---GIVEQCCTSICSLY---QL-ENYCN-
+> Alignment 2: HSQGTF----TSDYSKYLDSRAEQDF--V
 > Score:       22
 ```
 
-To compute the local alignment of insulin and glucagon sequences through CLI:
+To compute the local alignment of the same sequences, pass `--local`.
+The result is right-trimmed but not left-trimmed, which is what the recurrence's own traceback produces:
 
 ```bash
-
 $ affinegaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV --local
-> 
-> Sequence 1: GIVEQCCTSICSLYQLENYCN
-> Sequence 2: HSQGTFTSDYSKYLDSRAEQDFV
-> 
-> Alignment 1: TSICSLYQLEN
-> Alignment 2: TSDYSKY-LDS
+>
+> Alignment 1: ------GIVEQCCTSICSLYQLEN
+> Alignment 2: HSQGTF-------TSDYSKY-LDS
 > Score:       80
 ```
 
-## Testing & Development
+`--gpu` runs the same alignment on the device.
 
-To test, install the development dependencies and run the tests.
-
-```bash
-pip install -e ".[dev,jit]"
-pytest test.py -s -x
-```
-
-### Symmetry Test for Needleman-Wunsch
-
-First, verify that the Needleman-Wunsch algorithm is symmetric with respect to the argument order, assuming the substitution matrix is symmetric.
-
-```bash
-pytest test.py -s -x -k symmetry
-```
-
-### Needleman-Wunsch and Levenshtein Score Equivalence
-
-The Needleman-Wunsch alignment score should be equal to the negated Levenshtein distance for specific match/mismatch costs.
-
-```bash
-pytest test.py -s -x -k levenshtein
-```
-
-### Alignment vs Scoring Consistency
-
-Check that the alignment score is consistent with the scoring function for specific sequences and scoring parameters.
-
-```bash
-pytest test.py -s -x -k scoring_vs_alignment
-```
-
-### Gap Expansion Test
-
-Check the effect of gap expansions on alignment scores. This test ensures that increasing the width of gaps in alignments with zero gap extension penalties does not change the alignment score.
-
-```bash
-pytest test.py -s -x -k gap_expansions
-```
-
-### Comparison with BioPython Examples
-
-Compare the affine gap alignment scores with BioPython for specific sequence pairs and scoring parameters. This test ensures that the Needleman-Wunsch-Gotoh alignment scores are at least as good as BioPython's PairwiseAligner scores.
-
-```bash
-pytest test.py -s -x -k biopython_examples
-```
-
-### Fuzzy Comparison with BioPython
-
-Perform a fuzzy comparison of affine gap alignment scores with BioPython for randomly generated sequences. This test verifies that the Needleman-Wunsch-Gotoh alignment scores are at least as good as BioPython's PairwiseAligner scores for various gap penalties.
-
-```bash
-pytest test.py -s -x -k biopython_fuzzy
-```
-
-### EMBOSS and Other Tools
+## EMBOSS and Other Tools
 
 Seemingly the only correct known open-source implementation is located in `nucleus/embaln.c` file in the EMBOSS package in the `embAlignPathCalcWithEndGapPenalties` and `embAlignGetScoreNWMatrix` functions.
 That program was originally [implemented in 1999 by Alan Bleasby](https://www.bioinformatics.nl/cgi-bin/emboss/help/needle) and tweaked in 2000 for better scoring.
