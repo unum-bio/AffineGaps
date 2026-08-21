@@ -30,11 +30,38 @@ During my exploration of existing implementations, I've noticed several bugs:
 - combining opening and expansion costs where only the opening cost should be applied.
 - even the most correct `needle` from EMBOSS uses `float` representation, which would obviously be numerically unstable on very long sequences.
 
-### When to Use StringZilla Instead
+## Performance on GPU
 
-Reconstruction is what this project is for; raw scoring throughput is not.
-If you only need a score or a distance, [`ashvardanian/StringZilla`](https://github.com/ashvardanian/StringZilla) computes the same Levenshtein, Needleman-Wunsch and Smith-Waterman values far faster — its `stringzillas/similarities` kernels report 5910, 711 and 616 GCUPS on an H100 using bit-parallel Myers, Hopper DPX fused min/max, and 128x128 register micro-tiles.
-It carries no traceback in any backend, which is precisely the gap this module fills.
+One __NVIDIA H100 80GB HBM3__ against __WFA2__ on one CPU core, both reconstructing the alignment rather than only scoring it.
+DNA pairs at 10 percent divergence, the range long-read work lives in, with every score checked to agree exactly before timing.
+
+```
+                   wfa2 faster  ←│→  affinegaps faster
+    1 kbp                       ▍│                          1.1x
+   10 kbp                        │████▋                     2.2x
+  100 kbp                        │█████████████████        17.2x
+  300 kbp                        │██████████████████████   39.8x
+    1 Mbp                        │██████████████████████  out of memory
+```
+
+The last row is not a timing.
+WFA2 reconstructs exactly, and its traceback grows with the square of the alignment score, so a megabase pair at this divergence exhausts tens of gigabytes before finishing, where the linear-space recursion holds a few frontiers and finishes in seconds.
+
+That same growth is what decides every other row, and it makes the crossover a property of the data rather than of the sequence length.
+On a 30 kilobase pair, mutated harder each row:
+
+```
+                   wfa2 faster  ←│→  affinegaps faster
+     0.1%     ███████████████████│                         55.5x
+       1%            ███████████▊│                         12.0x
+       5%                        │█▊                        1.5x
+      10%                        │███████▌                  5.0x
+      25%                        │███████████████▊         28.3x
+      50%                        │████████████████████▋    79.7x
+    99.9%                        │██████████████████████  104.6x
+```
+
+A full sweep never notices how different the sequences are, so reach for WFA2 on near-identical inputs and for this on divergent or very long ones.
 
 ## Installation
 
@@ -43,14 +70,14 @@ Where Mojo ships a toolchain — Linux on x86-64 or ARM, and macOS on Apple sili
 Everywhere else you get the NumPy reference alone, from the same command.
 
 ```bash
-uv pip install git+https://github.com/unum-bio/AffineGaps.git
-uv pip install 'affinegaps[numba] @ git+https://github.com/unum-bio/AffineGaps.git'
+uv pip install git+https://github.com/unum-science/AffineGaps.git
+uv pip install 'affinegaps[numba] @ git+https://github.com/unum-science/AffineGaps.git'
 ```
 
 Pin a tag or a commit when the build has to be reproducible:
 
 ```bash
-uv pip install 'affinegaps @ git+https://github.com/unum-bio/AffineGaps.git@v0.2.5'
+uv pip install 'affinegaps @ git+https://github.com/unum-science/AffineGaps.git@v0.2.5'
 ```
 
 Two optional extras, neither of them required: `numba` accelerates the NumPy reference, and `color` paints the command-line output.
@@ -60,14 +87,14 @@ Two optional extras, neither of them required: `numba` accelerates the NumPy ref
 `uv tool install` puts `affinegaps` on your path without touching the current environment:
 
 ```bash
-$ uv tool install git+https://github.com/unum-bio/AffineGaps.git
+$ uv tool install git+https://github.com/unum-science/AffineGaps.git
 $ affinegaps GIVEQCCTSICSLYQLENYCN HSQGTFTSDYSKYLDSRAEQDFV --local
 ```
 
 The same tool is also built natively from a checkout, with no Python involved at run time:
 
 ```bash
-git clone https://github.com/unum-bio/AffineGaps.git && cd AffineGaps
+git clone https://github.com/unum-science/AffineGaps.git && cd AffineGaps
 pixi run install      # `affinegaps` on the PATH, compiled kernels included
 pixi run build-cli    # or build/affinegaps, a standalone binary
 ```
@@ -79,13 +106,13 @@ Both accept the same flags and print the same thing, so install whichever suits 
 A downstream [pixi](https://pixi.sh) project takes the same git dependency, pinned in `pixi.lock` beside everything else:
 
 ```bash
-pixi add --pypi 'affinegaps @ git+https://github.com/unum-bio/AffineGaps.git'
+pixi add --pypi 'affinegaps @ git+https://github.com/unum-science/AffineGaps.git'
 ```
 
 To run the tool once without installing anything, `uvx` fetches, builds and runs it in a throwaway environment:
 
 ```bash
-uvx --from git+https://github.com/unum-bio/AffineGaps.git affinegaps GATTACA GACTATA
+uvx --from git+https://github.com/unum-science/AffineGaps.git affinegaps GATTACA GACTATA
 ```
 
 ### Requirements for the GPU
@@ -116,9 +143,9 @@ Two axes: `backend` chooses which implementation, `device` chooses which hardwar
 Naming neither picks the fastest the machine offers.
 
 ```python
-needleman_wunsch_gotoh_alignment(insulin, glucagon)                            # fastest available
-needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="python")           # the reference
-needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="mojo")            # compiled, host
+needleman_wunsch_gotoh_alignment(insulin, glucagon)                     # fastest available
+needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="python")   # the reference
+needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="mojo")     # compiled, host
 needleman_wunsch_gotoh_alignment(insulin, glucagon, backend="mojo", device="gpu")
 ```
 

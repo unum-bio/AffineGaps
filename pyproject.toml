@@ -32,8 +32,8 @@ requires-python = ">=3.12"
 version = "0.2.5"
 
 [project.urls]
-Homepage = "https://github.com/unum-bio/AffineGaps"
-Repository = "https://github.com/unum-bio/AffineGaps.git"
+Homepage = "https://github.com/unum-science/AffineGaps"
+Repository = "https://github.com/unum-science/AffineGaps.git"
 
 [project.optional-dependencies]
 color = ["colorama"]
@@ -59,9 +59,9 @@ target-version = "py312"
 select = ["E", "F", "W", "B", "UP", "SIM", "RUF"]
 
 [tool.mypy]
-files = ["affinegaps.py"]
+files = ["affinegaps.py"] 
 ignore_missing_imports = true # NumBa and colorama are optional at runtime
-python_version = "3.12"
+python_version = "3.12" 
 
 # Without an explicit target hatchling sweeps the Mojo sources and the test file into the sdist.
 [tool.hatch.build.targets.sdist]

@@ -29,7 +29,8 @@ pixi run test       # the differential suite against affinegaps.py
 ```
 """
 
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.gpu import block_dim, block_idx, grid_dim, lane_id, thread_idx
+from std.gpu.primitives.warp import shuffle_up, shuffle_xor
 from std.memory import stack_allocation
 from std.memory.pointer import AddressSpace
 from std.os import abort
@@ -48,7 +49,7 @@ from std.sys.info import _accelerator_arch, has_accelerator
 comptime SCORE_DTYPE = DType.int32
 comptime SYMBOL_DTYPE = DType.uint8
 comptime SUBSTITUTION_DTYPE = DType.int8
-comptime CHANGE_DTYPE = DType.uint8
+comptime CHANGE_DTYPE = DType.uint32
 comptime OFFSET_DTYPE = DType.uint32
 
 comptime ALL_MODES = (AlignmentMode.GLOBAL, AlignmentMode.LOCAL)
@@ -95,10 +96,6 @@ def target_shared_per_multiprocessor() -> Int:
 
 comptime SHARED_PER_BLOCK = min(target_shared_per_multiprocessor() // BLOCKS_PER_MULTIPROCESSOR, STATIC_SHARED_LIMIT)
 
-# Seven bands of scores, deletions and insertions. The staged table and the reductions stay in
-# static shared memory; only the bands are carved out dynamically, so their length follows the
-# batch rather than a constant.
-comptime BANDS_PER_SWEEP = 7
 comptime REDUCTION_BYTES = THREADS_PER_BLOCK * 12
 comptime STATIC_SHARED_USED = MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE + REDUCTION_BYTES
 
@@ -106,17 +103,12 @@ comptime STATIC_SHARED_USED = MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE + REDUCTION_
 # Measured on this target: 227 kibibytes of dynamic shared memory launches, 228 does not.
 comptime SHARED_RESERVED = 1024
 comptime MAX_DYNAMIC_SHARED = target_shared_per_multiprocessor() - SHARED_RESERVED
-comptime MAX_BAND_LENGTH = (MAX_DYNAMIC_SHARED - STATIC_SHARED_USED) // (BANDS_PER_SWEEP * 4) - 1
+# A strip carries the score and insertion layers of the column to its left, one entry per row,
+# which is what bounds how long a first sequence one block can take.
+comptime CARRY_BANDS = 2
+comptime MAX_BAND_LENGTH = (MAX_DYNAMIC_SHARED - STATIC_SHARED_USED) // (CARRY_BANDS * 4) - 1
 
 
-def band_bytes(band_stride: Int) -> Int:
-    """Dynamic shared memory one block needs to hold its seven bands."""
-    return BANDS_PER_SWEEP * band_stride * 4
-
-
-# A quarter of the range: far below any reachable score, which a path bounds by
-# `(rows + columns) * max_cost`, while leaving headroom for the gap penalties that get added to
-# the seed as a reduction proceeds. `Int32.MIN` itself underflows on the first addition.
 comptime NEGATIVE_INFINITY = Int32.MIN // 4
 
 
@@ -290,51 +282,6 @@ def gotoh_cell[
     return Cell(score, deletion, insertion)
 
 
-@fieldwise_init
-struct Wavefront[address_space: AddressSpace](ImplicitlyCopyable, TrivialRegisterPassable):
-    """The seven live bands of an anti-diagonal sweep, rotated one diagonal at a time.
-
-    Scores reach two diagonals back because a substitution step skips one; the two gap layers
-    reach only one. The band written on a diagonal is never one read on that diagonal, which is
-    why a single barrier per diagonal suffices.
-    """
-
-    var scores_two_back: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
-    var scores_one_back: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
-    var scores_current: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
-    var deletes_one_back: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
-    var deletes_current: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
-    var inserts_one_back: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
-    var inserts_current: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space]
-
-    @staticmethod
-    @always_inline
-    def over(
-        bands: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin, address_space=Self.address_space],
-        stride: Int,
-    ) -> Self:
-        """Carves `BANDS_PER_SWEEP` equal bands out of one allocation."""
-        return Self(
-            bands,
-            bands.unsafe_offset(stride),
-            bands.unsafe_offset(2 * stride),
-            bands.unsafe_offset(3 * stride),
-            bands.unsafe_offset(4 * stride),
-            bands.unsafe_offset(5 * stride),
-            bands.unsafe_offset(6 * stride),
-        )
-
-    @always_inline
-    def rotate(mut self):
-        """Retires the oldest score band and hands it back as the next diagonal's target."""
-        var recycled = self.scores_two_back
-        self.scores_two_back = self.scores_one_back
-        self.scores_one_back = self.scores_current
-        self.scores_current = recycled
-        swap(self.deletes_one_back, self.deletes_current)
-        swap(self.inserts_one_back, self.inserts_current)
-
-
 @always_inline
 def source_layer(cell: Cell, replacement: Int32) -> Layer:
     """Which layer the score came from; ties resolve to aligning, then deleting."""
@@ -379,13 +326,37 @@ struct CellDecision(ImplicitlyCopyable, TrivialRegisterPassable):
     def reach(self) -> PathReach:
         return PathReach(self.bits >> 7)
 
+    @always_inline
+    def nibble(self) -> UInt32:
+        """The four bits `advance` reads, with a clamped local cell folded into a spare code.
+
+        `Layer` has three values, so the two-bit source field has a fourth code free. Spending it
+        on `reach` is sound because `advance` consults `source` only from the aligning layer, and
+        a walk in that layer breaks on `reach` before it ever gets there.
+        """
+        var code = UInt32(self.bits & 0x0F)
+        return (code | 0x03) if self.reach() == PathReach.ENDS_HERE else code
+
+    @staticmethod
+    @always_inline
+    def unpacking(code: UInt32) -> Self:
+        """Inverse of `nibble`, restoring the flag from the spare source code."""
+        var bits = UInt8(code & 0x0F)
+        if (bits & 0x03) == 0x03:
+            return Self((bits & 0x0C) | (PathReach.ENDS_HERE.identifier << 7))
+        return Self(bits)
+
 
 @always_inline
-def decide(cell: Cell, replacement: Int32, above: Cell, left: Cell, scoring: AffineGapCosts) -> CellDecision:
+def decide[
+    mode: AlignmentMode
+](cell: Cell, replacement: Int32, above: Cell, left: Cell, scoring: AffineGapCosts) -> CellDecision:
     """The four answers a kernel packs, re-derived from the three score layers."""
     var deletion_run = GapRun.EXTENDS if above.deletion + scoring.extend > above.score + scoring.open else GapRun.OPENS
     var insertion_run = GapRun.EXTENDS if left.insertion + scoring.extend > left.score + scoring.open else GapRun.OPENS
-    var reach = PathReach.ENDS_HERE if cell.score <= 0 else PathReach.CONTINUES_PAST
+    var reach = PathReach.CONTINUES_PAST
+    comptime if mode == AlignmentMode.LOCAL:
+        reach = PathReach.ENDS_HERE if cell.score <= 0 else PathReach.CONTINUES_PAST
     return CellDecision.recording(source_layer(cell, replacement), deletion_run, insertion_run, reach)
 
 
@@ -603,7 +574,9 @@ def reconstruct(
     while row > 0 and column > 0:
         var here = row * stride + column
         var substitution = Int32(substitutions[Int(first[row - 1]) * alphabet_size + Int(second[column - 1])])
-        var decision = decide(
+        # `mode` is a runtime argument here, and only the local walk below reads `reach`, so the
+        # flag is always computed and always gated at the point of use.
+        var decision = decide[AlignmentMode.LOCAL](
             Cell(scores[here], deletes[here], inserts[here]),
             scores[here - stride - 1] + substitution,
             Cell(scores[here - stride], deletes[here - stride], inserts[here - stride]),
@@ -816,7 +789,7 @@ def direct_tile(
         var substitution = Int32(
             substitutions[Int(first[first_from + row - 1]) * alphabet_size + Int(second[second_from + column - 1])]
         )
-        var decision = decide(
+        var decision = decide[AlignmentMode.GLOBAL](
             Cell(scores[here], deletes[here], inserts[here]),
             scores[here - stride - 1] + substitution,
             Cell(scores[here - stride], deletes[here - stride], inserts[here - stride]),
@@ -1011,9 +984,7 @@ def hirschberg_window(
         # two halves each charged an opening for their part of the run, the refund removes one,
         # and both children are told the run is already open at the edge they share.
         var crosses_in_a_gap = best_gapped > best_plain
-        var crossing = second_from + (
-            best_gapped_column if crosses_in_a_gap else best_plain_column
-        )
+        var crossing = second_from + (best_gapped_column if crosses_in_a_gap else best_plain_column)
         var shared_edge = GapRun.EXTENDS if crosses_in_a_gap else GapRun.OPENS
         # Lower half first, so the upper half pops first and the two row ranges tile in order.
         frames.append(Frame(split, first_to, crossing, second_to, shared_edge, bottom))
@@ -1203,118 +1174,6 @@ def block_argmax(
         span //= 2
 
 
-def wavefront_kernel[
-    mode: AlignmentMode
-](
-    sequences: Pointer[Scalar[SYMBOL_DTYPE], MutAnyOrigin],
-    offsets: Pointer[Scalar[OFFSET_DTYPE], MutAnyOrigin],
-    substitutions: Pointer[Scalar[SUBSTITUTION_DTYPE], MutAnyOrigin],
-    results: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
-    band_stride: Int32,
-    alphabet_size: Int32,
-    open: Int32,
-    extend: Int32,
-):
-    """One block per pair, one thread per cell of the live anti-diagonal.
-
-    Bands are indexed by the row, so cell `(i, d - i)` reads rows `i - 1` and `i` of the two
-    preceding diagonals. The band written each diagonal is never one read that diagonal, so a
-    single barrier per diagonal suffices.
-    """
-    var pair = Int(block_idx.x)
-    var first_start = Int(offsets[unsafe_offset=2 * pair])
-    var scoring = AffineGapCosts(open, extend)
-    var second_start = Int(offsets[unsafe_offset=2 * pair + 1])
-    var rows = second_start - first_start
-    var columns = Int(offsets[unsafe_offset=2 * pair + 2]) - second_start
-    var width = Int(alphabet_size)
-
-    var bands = external_memory[Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED, alignment=16, name="bands"]()
-
-    var stride = Int(band_stride)
-    var wavefront = Wavefront.over(bands, stride)
-
-    # The substitution table is read once per cell, so it is staged into shared memory rather
-    # than fetched from global on every comparison. It is at most a kilobyte.
-    var scores_table = stack_allocation[
-        MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE,
-        Scalar[SUBSTITUTION_DTYPE],
-        address_space=AddressSpace.SHARED,
-    ]()
-    for index in range(Int(thread_idx.x), width * width, Int(block_dim.x)):
-        scores_table[unsafe_offset=index] = substitutions[unsafe_offset=index]
-    barrier()
-
-    var best = Int32(0)
-    var last_diagonal = rows + columns
-
-    for diagonal in range(0, last_diagonal + 1):
-        var row_low = max(0, diagonal - columns)
-        var row_high = min(rows, diagonal)
-
-        for row in range(row_low + Int(thread_idx.x), row_high + 1, THREADS_PER_BLOCK):
-            var column = diagonal - row
-            var cell = Int32(0)
-            var deletion = Int32(0)
-            var insertion = Int32(0)
-
-            if row == 0 and column == 0:
-                cell = 0
-                deletion = cell + open + extend
-                insertion = deletion
-            elif row == 0:
-                if mode == AlignmentMode.GLOBAL:
-                    cell = open + Int32(column - 1) * extend
-                    deletion = cell + open + extend
-                else:
-                    cell = 0
-                    deletion = open + extend
-                insertion = deletion
-            elif column == 0:
-                if mode == AlignmentMode.GLOBAL:
-                    cell = open + Int32(row - 1) * extend
-                    insertion = cell + open + extend
-                else:
-                    cell = 0
-                    insertion = open + extend
-                deletion = insertion
-            else:
-                var left_symbol = Int(sequences[unsafe_offset=first_start + row - 1])
-                var right_symbol = Int(sequences[unsafe_offset=second_start + column - 1])
-                var substitution = Int32(scores_table[unsafe_offset=left_symbol * width + right_symbol])
-                var computed = gotoh_cell[mode](
-                    wavefront.scores_two_back[unsafe_offset=row - 1],
-                    wavefront.scores_one_back[unsafe_offset=row - 1],
-                    wavefront.deletes_one_back[unsafe_offset=row - 1],
-                    wavefront.scores_one_back[unsafe_offset=row],
-                    wavefront.inserts_one_back[unsafe_offset=row],
-                    substitution,
-                    scoring,
-                )
-                cell = computed.score
-                deletion = computed.deletion
-                insertion = computed.insertion
-                comptime if mode == AlignmentMode.LOCAL:
-                    best = max(best, cell)
-
-            wavefront.scores_current[unsafe_offset=row] = cell
-            wavefront.deletes_current[unsafe_offset=row] = deletion
-            wavefront.inserts_current[unsafe_offset=row] = insertion
-            # The thread owning the bottom-right cell reports the global answer itself.
-            comptime if mode == AlignmentMode.GLOBAL:
-                if diagonal == last_diagonal and row == rows:
-                    results[unsafe_offset=pair] = cell
-
-        barrier()
-
-        wavefront.rotate()
-
-    if mode == AlignmentMode.LOCAL:
-        var highest = block.max[block_size=THREADS_PER_BLOCK](best)
-        if thread_idx.x == 0:
-            results[unsafe_offset=pair] = highest
-
-
 def upload[dtype: DType](ctx: DeviceContext, values: ImmSpan[Scalar[dtype], _]) raises -> DeviceBuffer[dtype]:
     """Stages values onto the device, keeping a one-element floor so an empty batch is not a case."""
     var buffer = ctx.enqueue_create_buffer[dtype](max(len(values), 1))
@@ -1350,14 +1209,14 @@ def wavefront_scores[
     for pair in range(pairs):
         longest_first = max(longest_first, Int(offsets[2 * pair + 1]) - Int(offsets[2 * pair]))
     var band_stride = longest_first + 1
-    var dynamic_bytes = band_bytes(band_stride)
+    var dynamic_bytes = 2 * band_stride * 4
 
     var sequences_buffer = upload(ctx, sequences)
     var offsets_buffer = upload(ctx, offsets)
     var substitutions_buffer = upload(ctx, substitutions)
     var results_buffer = zeroed[SCORE_DTYPE](ctx, pairs)
 
-    ctx.enqueue_function[wavefront_kernel[mode]](
+    ctx.enqueue_function[strip_score_kernel[mode]](
         sequences_buffer.unsafe_ptr(),
         offsets_buffer.unsafe_ptr(),
         substitutions_buffer.unsafe_ptr(),
@@ -1367,7 +1226,7 @@ def wavefront_scores[
         scoring.open,
         scoring.extend,
         grid_dim=pairs,
-        block_dim=THREADS_PER_BLOCK,
+        block_dim=STRIP_LANES,
         shared_mem_bytes=dynamic_bytes,
         func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(dynamic_bytes)),
     )
@@ -1394,147 +1253,168 @@ def direct_align_kernel[
     second_gapped: Pointer[Scalar[SYMBOL_DTYPE], MutAnyOrigin],
     gapped_lengths: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
     gapped_stride: Int32,
-    band_stride: Int32,
+    carry_stride: Int32,
     alphabet_size: Int32,
     open: Int32,
     extend: Int32,
 ):
-    """Anti-diagonal sweep that records every decision, then walks it back on the device.
+    """A recording strip: every decision is packed as the cell is computed, then walked back.
 
-    The decision byte carries the operation in its low bits and, for local alignment, a flag
-    marking a cell whose score is zero. That flag stands in for the `scores[i, j] > 0` test the
-    Python traceback performs, so the score matrix itself never has to be kept.
+    A lane packs its `STRIP_COLUMNS` decisions into one word and stores it under `step` rather
+    than `row`. The 32 lanes of one step sit on 32 different rows but share the step, so the
+    step-major address makes the warp lay down 128 contiguous bytes where a row-major address
+    would scatter the same warp over 32 sectors. The walk inverts it in closed form.
+
+    Four bits hold a cell because `advance` reads exactly the source layer and the two run flags,
+    and a clamped local cell borrows `Layer`'s spare source code instead of a fifth bit.
     """
     var pair = Int(block_idx.x)
     var first_start = Int(offsets[unsafe_offset=2 * pair])
-    var scoring = AffineGapCosts(open, extend)
     var second_start = Int(offsets[unsafe_offset=2 * pair + 1])
     var rows = second_start - first_start
     var columns = Int(offsets[unsafe_offset=2 * pair + 2]) - second_start
     var width = Int(alphabet_size)
+    var scoring = AffineGapCosts(open, extend)
+    var lane = Int(lane_id())
     var stride = columns + 1
     var tile = Int(change_offsets[unsafe_offset=pair])
+    var strip_span = (rows + STRIP_LANES) * STRIP_LANES
 
-    var bands = external_memory[Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED, alignment=16, name="bands"]()
-    var best_scores = stack_allocation[THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED]()
-    var best_places = stack_allocation[THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED]()
-
-    var band = Int(band_stride)
-    var wavefront = Wavefront.over(bands, band)
-
-    # The substitution table is read once per cell, so it is staged into shared memory rather
-    # than fetched from global on every comparison. It is at most a kilobyte.
-    var scores_table = stack_allocation[
+    var table = stack_allocation[
         MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE,
         Scalar[SUBSTITUTION_DTYPE],
         address_space=AddressSpace.SHARED,
     ]()
     for index in range(Int(thread_idx.x), width * width, Int(block_dim.x)):
-        scores_table[unsafe_offset=index] = substitutions[unsafe_offset=index]
+        table[unsafe_offset=index] = substitutions[unsafe_offset=index]
+
+    # The bottom-right cell belongs to whichever lane owns the last column, and the walk runs on
+    # lane zero, so the global answer crosses the warp through one shared word.
+    var reported = stack_allocation[1, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED]()
+    if thread_idx.x == 0:
+        var span = rows + columns
+        comptime if mode == AlignmentMode.GLOBAL:
+            reported[unsafe_offset=0] = 0 if span == 0 else scoring.open + Int32(span - 1) * scoring.extend
+        else:
+            reported[unsafe_offset=0] = 0
+
+    var carry = external_memory[Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED, alignment=16, name="carry"]()
+    var carry_h = carry
+    var carry_i = carry.unsafe_offset(Int(carry_stride))
+    for index in range(Int(thread_idx.x), rows + 1, Int(block_dim.x)):
+        var border = Int32(0)
+        comptime if mode == AlignmentMode.GLOBAL:
+            border = 0 if index == 0 else scoring.open + Int32(index - 1) * scoring.extend
+        carry_h[unsafe_offset=index] = border
+        carry_i[unsafe_offset=index] = border + scoring.open + scoring.extend
     barrier()
 
     var best = Int32(0)
     var best_place = Int64(0)
-    var answer = Int32(0)
-    var last_diagonal = rows + columns
+    var strips = (columns + STRIP_WIDTH - 1) // STRIP_WIDTH
 
-    for diagonal in range(0, last_diagonal + 1):
-        var row_low = max(0, diagonal - columns)
-        var row_high = min(rows, diagonal)
+    for strip in range(strips):
+        var first_column = strip * STRIP_WIDTH + lane * STRIP_COLUMNS
+        var owned = min(max(columns - first_column, 0), STRIP_COLUMNS)
 
-        for row in range(row_low + Int(thread_idx.x), row_high + 1, THREADS_PER_BLOCK):
-            var column = diagonal - row
-            var cell = Int32(0)
-            var deletion = Int32(0)
-            var insertion = Int32(0)
-            # The walk is guarded by `row > 0 and column > 0`, so no border decision is ever read.
-            var decision = CellDecision(0)
+        var symbols = InlineArray[Int32, STRIP_COLUMNS](fill=0)
+        comptime for k in range(STRIP_COLUMNS):
+            var column = min(first_column + k, columns - 1)
+            symbols[k] = Int32(sequences[unsafe_offset=second_start + max(column, 0)])
 
-            if row == 0 and column == 0:
-                cell = 0
-                deletion = cell + open + extend
-                insertion = deletion
-            elif row == 0:
-                if mode == AlignmentMode.GLOBAL:
-                    cell = open + Int32(column - 1) * extend
-                    deletion = cell + open + extend
-                else:
-                    cell = 0
-                    deletion = open + extend
-                insertion = deletion
-            elif column == 0:
-                if mode == AlignmentMode.GLOBAL:
-                    cell = open + Int32(row - 1) * extend
-                    insertion = cell + open + extend
-                else:
-                    cell = 0
-                    insertion = open + extend
-                deletion = insertion
-            else:
-                var left_symbol = Int(sequences[unsafe_offset=first_start + row - 1])
-                var right_symbol = Int(sequences[unsafe_offset=second_start + column - 1])
-                var substitution = Int32(scores_table[unsafe_offset=left_symbol * width + right_symbol])
-                var replacement = wavefront.scores_two_back[unsafe_offset=row - 1] + substitution
-                var computed = gotoh_cell[mode](
-                    wavefront.scores_two_back[unsafe_offset=row - 1],
-                    wavefront.scores_one_back[unsafe_offset=row - 1],
-                    wavefront.deletes_one_back[unsafe_offset=row - 1],
-                    wavefront.scores_one_back[unsafe_offset=row],
-                    wavefront.inserts_one_back[unsafe_offset=row],
-                    substitution,
-                    scoring,
-                )
-                cell = computed.score
-                deletion = computed.deletion
-                insertion = computed.insertion
-                var deletion_run = (
-                    GapRun.EXTENDS if wavefront.deletes_one_back[unsafe_offset=row - 1] + extend
-                    > wavefront.scores_one_back[unsafe_offset=row - 1] + open else GapRun.OPENS
-                )
-                var insertion_run = (
-                    GapRun.EXTENDS if wavefront.inserts_one_back[unsafe_offset=row] + extend
-                    > wavefront.scores_one_back[unsafe_offset=row] + open else GapRun.OPENS
-                )
-                var reach = PathReach.CONTINUES_PAST
-                comptime if mode == AlignmentMode.LOCAL:
-                    reach = PathReach.ENDS_HERE if cell == 0 else PathReach.CONTINUES_PAST
-                decision = CellDecision.recording(
-                    source_layer(computed, replacement), deletion_run, insertion_run, reach
-                )
+        var h = InlineArray[Int32, STRIP_COLUMNS](fill=0)
+        var e = InlineArray[Int32, STRIP_COLUMNS](fill=0)
+        comptime for k in range(STRIP_COLUMNS):
+            comptime if mode == AlignmentMode.GLOBAL:
+                h[k] = scoring.open + Int32(first_column + k) * scoring.extend
+            e[k] = h[k] + scoring.open + scoring.extend
 
-                if mode == AlignmentMode.LOCAL:
-                    var place = Int64(row) * Int64(stride) + Int64(column)
-                    if cell > best:
-                        best = cell
-                        best_place = place
-                    elif cell == best and cell != 0 and place < best_place:
-                        best_place = place
+        var past = first_column + STRIP_COLUMNS
+        var edge_h = Int32(0)
+        comptime if mode == AlignmentMode.GLOBAL:
+            edge_h = scoring.open + Int32(past - 1) * scoring.extend
+        var edge_i = edge_h + scoring.open + scoring.extend
 
-            wavefront.scores_current[unsafe_offset=row] = cell
-            wavefront.deletes_current[unsafe_offset=row] = deletion
-            wavefront.inserts_current[unsafe_offset=row] = insertion
-            changes[unsafe_offset=tile + row * stride + column] = decision.bits
-            if diagonal == last_diagonal and row == rows:
-                answer = cell
+        var diagonal_carry = Int32(0)
+        comptime if mode == AlignmentMode.GLOBAL:
+            diagonal_carry = 0 if first_column == 0 else scoring.open + Int32(first_column - 1) * scoring.extend
 
+        for step in range(1, rows + STRIP_LANES + 1):
+            var row = step - lane
+            var left_h = shuffle_up(edge_h, 1)
+            var left_i = shuffle_up(edge_i, 1)
+            if lane == 0:
+                var here = min(max(row, 0), rows)
+                left_h = carry_h[unsafe_offset=here]
+                left_i = carry_i[unsafe_offset=here]
+            var left_h_above = diagonal_carry
+            diagonal_carry = left_h
+
+            if row >= 1 and row <= rows:
+                var symbol = Int(sequences[unsafe_offset=first_start + row - 1])
+                var diagonal = left_h_above
+                var running_h = left_h
+                var running_i = left_i
+                var packed = UInt32(0)
+                comptime for k in range(STRIP_COLUMNS):
+                    var substitution = Int32(table[unsafe_offset=symbol * width + Int(symbols[k])])
+                    var replacement = diagonal + substitution
+                    var computed = gotoh_cell[mode](diagonal, h[k], e[k], running_h, running_i, substitution, scoring)
+                    # Both neighbours the decision needs are still in registers, unread.
+                    var decision = decide[mode](
+                        computed,
+                        replacement,
+                        Cell(h[k], e[k], 0),
+                        Cell(running_h, 0, running_i),
+                        scoring,
+                    )
+                    packed |= decision.nibble() << UInt32(4 * k)
+                    diagonal = h[k]
+                    h[k] = computed.score
+                    e[k] = computed.deletion
+                    running_h = computed.score
+                    running_i = computed.insertion
+                    comptime if mode == AlignmentMode.LOCAL:
+                        if k < owned:
+                            var place = Int64(row) * Int64(stride) + Int64(first_column + k + 1)
+                            if computed.score > best:
+                                best = computed.score
+                                best_place = place
+                            elif computed.score == best and computed.score != 0 and place < best_place:
+                                best_place = place
+                changes[unsafe_offset=tile + strip * strip_span + step * STRIP_LANES + lane] = packed
+                edge_h = running_h
+                edge_i = running_i
+                if lane == STRIP_LANES - 1 and owned > 0:
+                    carry_h[unsafe_offset=row] = h[STRIP_COLUMNS - 1]
+                    carry_i[unsafe_offset=row] = running_i
+                comptime if mode == AlignmentMode.GLOBAL:
+                    if row == rows and owned > 0 and first_column + owned == columns:
+                        reported[unsafe_offset=0] = h[owned - 1]
         barrier()
 
-        wavefront.rotate()
-
-    # Pick the first row-major maximum, matching the strict `>` of the Python scan.
-    block_argmax(best_scores, best_places, best, best_place)
+    # Warp-wide, keeping the earliest cell in row-major order on a tie, which is what the
+    # Python scan's strict `>` picks. Every lane holds the winner afterwards.
+    comptime if mode == AlignmentMode.LOCAL:
+        var span = UInt32(1)
+        while span < UInt32(STRIP_LANES):
+            var theirs = shuffle_xor(best, span)
+            var their_place = shuffle_xor(best_place, span)
+            if theirs > best or (theirs == best and theirs != 0 and their_place < best_place):
+                best = theirs
+                best_place = their_place
+            span *= 2
 
     if thread_idx.x != 0:
         return
 
     var start_row = rows
     var start_column = columns
-    var final_score = answer
-    if mode == AlignmentMode.LOCAL:
-        var place = best_places[unsafe_offset=0]
-        final_score = best_scores[unsafe_offset=0]
-        start_row = Int(place // Int64(stride))
-        start_column = Int(place % Int64(stride))
+    var final_score = reported[unsafe_offset=0]
+    comptime if mode == AlignmentMode.LOCAL:
+        final_score = best
+        start_row = Int(best_place // Int64(stride))
+        start_column = Int(best_place % Int64(stride))
         if final_score == 0:
             start_row = 0
             start_column = 0
@@ -1546,7 +1426,12 @@ def direct_align_kernel[
     var state = Layer.ALIGNING
 
     while row > 0 and column > 0:
-        var decision = CellDecision(changes[unsafe_offset=tile + row * stride + column])
+        var offset = column - 1
+        var walk_lane = (offset % STRIP_WIDTH) // STRIP_COLUMNS
+        var word = changes[
+            unsafe_offset=tile + (offset // STRIP_WIDTH) * strip_span + (row + walk_lane) * STRIP_LANES + walk_lane
+        ]
+        var decision = CellDecision.unpacking(word >> UInt32(4 * (offset % STRIP_COLUMNS)))
         if mode == AlignmentMode.LOCAL and state == Layer.ALIGNING:
             if decision.reach() == PathReach.ENDS_HERE:
                 break
@@ -1611,7 +1496,8 @@ def direct_alignments[
         longest_first = max(longest_first, rows)
         var columns = Int(offsets[2 * pair + 2]) - Int(offsets[2 * pair + 1])
         change_offsets.append(running)
-        running += Int64(rows + 1) * Int64(columns + 1)
+        var strips = (columns + STRIP_WIDTH - 1) // STRIP_WIDTH
+        running += Int64(strips) * Int64(rows + STRIP_LANES) * Int64(STRIP_LANES)
         widest = max(widest, rows + columns)
     change_offsets.append(running)
 
@@ -1646,9 +1532,9 @@ def direct_alignments[
         scoring.open,
         scoring.extend,
         grid_dim=pairs,
-        block_dim=THREADS_PER_BLOCK,
-        shared_mem_bytes=band_bytes(longest_first + 1),
-        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(band_bytes(longest_first + 1))),
+        block_dim=STRIP_LANES,
+        shared_mem_bytes=2 * (longest_first + 1) * 4,
+        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(2 * (longest_first + 1) * 4)),
     )
     ctx.synchronize()
 
@@ -1734,8 +1620,14 @@ def hirschberg_path_gpu(
                 continue
             if width == 0 or height <= 2 or (height + 1) * (width + 1) <= tile_cells:
                 tile_frame(
-                    first, second, frame, substitutions, alphabet_size, scoring,
-                    path_columns, path_entries,
+                    first,
+                    second,
+                    frame,
+                    substitutions,
+                    alphabet_size,
+                    scoring,
+                    path_columns,
+                    path_entries,
                 )
             else:
                 splitting.append(frame)
@@ -1752,16 +1644,28 @@ def hirschberg_path_gpu(
             # The second sequence is stored after the first, so its indices carry that offset.
             sweeps.append(
                 Sweep(
-                    split - frame.first_from, width, frame.first_from,
-                    rows + frame.second_from, frame.first_from, frame.second_from,
-                    frame.top, SweepHalf.FORWARD, False,
+                    split - frame.first_from,
+                    width,
+                    frame.first_from,
+                    rows + frame.second_from,
+                    frame.first_from,
+                    frame.second_from,
+                    frame.top,
+                    SweepHalf.FORWARD,
+                    False,
                 )
             )
             sweeps.append(
                 Sweep(
-                    frame.first_to - split, width, split,
-                    rows + frame.second_from, split, frame.second_from,
-                    frame.bottom, SweepHalf.REVERSE, False,
+                    frame.first_to - split,
+                    width,
+                    split,
+                    rows + frame.second_from,
+                    split,
+                    frame.second_from,
+                    frame.bottom,
+                    SweepHalf.REVERSE,
+                    False,
                 )
             )
             joins[index * 3 + 2] = Scalar[SCORE_DTYPE](width)
@@ -1798,125 +1702,181 @@ def hirschberg_path_gpu(
                 # are ordinary; the second is what the boundary flags carry, since the two halves
                 # each charged an opening and the refund removes one.
                 var crosses_in_a_gap = best_gapped > best_plain
-                var crossing = frame.second_from + (
-                    best_gapped_column if crosses_in_a_gap else best_plain_column
-                )
+                var crossing = frame.second_from + (best_gapped_column if crosses_in_a_gap else best_plain_column)
                 var shared_edge = GapRun.EXTENDS if crosses_in_a_gap else GapRun.OPENS
-                children.append(
-                    Frame(frame.first_from, split, frame.second_from, crossing, frame.top, shared_edge)
-                )
-                children.append(
-                    Frame(split, frame.first_to, crossing, frame.second_to, shared_edge, frame.bottom)
-                )
+                children.append(Frame(frame.first_from, split, frame.second_from, crossing, frame.top, shared_edge))
+                children.append(Frame(split, frame.first_to, crossing, frame.second_to, shared_edge, frame.bottom))
         frames = children^
 
 
-def local_extremum_kernel[
-    half: SweepHalf
+comptime DEFAULT_TILE_CELLS = 4096
+
+# One pair on the stored device path gets a single warp, while the linear recursion spreads the
+# same matrix over the whole machine, so the device crossover sits far below what device memory
+# would allow. Measured here: level near a million cells, and the recursion is three times faster
+# by sixteen million. A batch inverts the argument, since the recursion takes its pairs in turn,
+# and keeps the caller's budget.
+comptime DEVICE_STORED_CELLS = 1_000_000
+
+comptime STRIP_COLUMNS = 8
+comptime STRIP_LANES = 32
+comptime STRIP_WIDTH = STRIP_COLUMNS * STRIP_LANES
+
+
+def strip_score_kernel[
+    mode: AlignmentMode
 ](
     sequences: Pointer[Scalar[SYMBOL_DTYPE], MutAnyOrigin],
+    offsets: Pointer[Scalar[OFFSET_DTYPE], MutAnyOrigin],
     substitutions: Pointer[Scalar[SUBSTITUTION_DTYPE], MutAnyOrigin],
-    bands: Pointer[Scalar[SCORE_DTYPE], MutUntrackedOrigin],
-    outcome: Pointer[Scalar[DType.int64], MutAnyOrigin],
-    first_from: Int32,
-    first_to: Int32,
-    second_from: Int32,
-    second_to: Int32,
+    results: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
+    carry_stride: Int32,
     alphabet_size: Int32,
     open: Int32,
     extend: Int32,
 ):
-    """Local sweep reporting the first row-major maximum, with its bands in global memory.
+    """One warp per pair. Lane `t` owns `STRIP_COLUMNS` columns and sits on row `s - t` at step `s`.
 
-    Local alignment has unknown endpoints, so this runs twice: forwards it says where the best
-    alignment ends, and backwards over those prefixes it says how far back the same alignment
-    reaches. Ties resolve to the earliest cell in row-major order, matching the Python's scan.
+    The skew turns the left-neighbour dependency into "lane `t - 1`'s value from the previous
+    step", so it travels by one `shuffle_up` instead of shared memory and a barrier, and each
+    lane keeps its own columns' layers in registers for the whole sweep.
+
+    Strips of `STRIP_WIDTH` columns are swept left to right, carrying the rightmost column in
+    shared memory. Lane 0 reads row `s` from that carry while lane 31 writes row `s - 31`, so the
+    reader stays ahead of the writer and one buffer suffices.
     """
-    var rows = Int(first_to - first_from)
-    var columns = Int(second_to - second_from)
+    var pair = Int(block_idx.x)
+    var first_start = Int(offsets[unsafe_offset=2 * pair])
+    var second_start = Int(offsets[unsafe_offset=2 * pair + 1])
+    var rows = second_start - first_start
+    var columns = Int(offsets[unsafe_offset=2 * pair + 2]) - second_start
     var width = Int(alphabet_size)
-    var stride = rows + 1
-    comptime reversed_order = half == SweepHalf.REVERSE
     var scoring = AffineGapCosts(open, extend)
+    var lane = Int(lane_id())
 
-    var scores_table = stack_allocation[
+    # An empty side leaves only the border, which no sweep step would visit.
+    if rows == 0 or columns == 0:
+        if thread_idx.x == 0:
+            comptime if mode == AlignmentMode.GLOBAL:
+                var span = rows + columns
+                results[unsafe_offset=pair] = 0 if span == 0 else scoring.open + Int32(span - 1) * scoring.extend
+            else:
+                results[unsafe_offset=pair] = 0
+        return
+
+    var table = stack_allocation[
         MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE,
         Scalar[SUBSTITUTION_DTYPE],
         address_space=AddressSpace.SHARED,
     ]()
-    var best_scores = stack_allocation[THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED]()
-    var best_places = stack_allocation[THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED]()
     for index in range(Int(thread_idx.x), width * width, Int(block_dim.x)):
-        scores_table[unsafe_offset=index] = substitutions[unsafe_offset=index]
+        table[unsafe_offset=index] = substitutions[unsafe_offset=index]
+
+    # Column zero of the strip about to be swept: the score layer and the insertion layer, one
+    # entry per row. Two bands where the anti-diagonal sweep needed seven.
+    var carry = external_memory[Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED, alignment=16, name="carry"]()
+    var carry_h = carry
+    var carry_i = carry.unsafe_offset(Int(carry_stride))
+    for index in range(Int(thread_idx.x), rows + 1, Int(block_dim.x)):
+        var border = Int32(0)
+        comptime if mode == AlignmentMode.GLOBAL:
+            border = 0 if index == 0 else scoring.open + Int32(index - 1) * scoring.extend
+        carry_h[unsafe_offset=index] = border
+        carry_i[unsafe_offset=index] = border + scoring.open + scoring.extend
     barrier()
 
-    var wavefront = Wavefront.over(bands, stride)
-
     var best = Int32(0)
-    var best_place = Int64(0)
-    var last_diagonal = rows + columns
+    var strips = (columns + STRIP_WIDTH - 1) // STRIP_WIDTH
 
-    for diagonal in range(0, last_diagonal + 1):
-        var row_low = max(0, diagonal - columns)
-        var row_high = min(rows, diagonal)
+    for strip in range(strips):
+        var first_column = strip * STRIP_WIDTH + lane * STRIP_COLUMNS
+        var owned = min(max(columns - first_column, 0), STRIP_COLUMNS)
 
-        for row in range(row_low + Int(thread_idx.x), row_high + 1, Int(block_dim.x)):
-            var column = diagonal - row
-            var cell = Int32(0)
-            var deletion = open + extend
-            var insertion = open + extend
+        var letters = InlineArray[Int32, STRIP_COLUMNS](fill=0)
+        comptime for k in range(STRIP_COLUMNS):
+            var column = min(first_column + k, columns - 1)
+            letters[k] = Int32(sequences[unsafe_offset=second_start + column])
 
-            if row > 0 and column > 0:
-                var left_index = Int(first_to) - row if reversed_order else Int(first_from) + row - 1
-                var right_index = Int(second_to) - column if reversed_order else Int(second_from) + column - 1
-                var left_symbol = Int(sequences[unsafe_offset=left_index])
-                var right_symbol = Int(sequences[unsafe_offset=right_index])
-                var substitution = Int32(scores_table[unsafe_offset=left_symbol * width + right_symbol])
-                var computed = gotoh_cell[AlignmentMode.LOCAL](
-                    wavefront.scores_two_back[unsafe_offset=row - 1],
-                    wavefront.scores_one_back[unsafe_offset=row - 1],
-                    wavefront.deletes_one_back[unsafe_offset=row - 1],
-                    wavefront.scores_one_back[unsafe_offset=row],
-                    wavefront.inserts_one_back[unsafe_offset=row],
-                    substitution,
-                    scoring,
-                )
-                cell = computed.score
-                deletion = computed.deletion
-                insertion = computed.insertion
-                var place = Int64(row) * Int64(columns + 1) + Int64(column)
-                if cell > best:
-                    best = cell
-                    best_place = place
-                elif cell == best and cell != 0 and place < best_place:
-                    best_place = place
+        # Row zero of the matrix, for the columns this lane owns.
+        var h = InlineArray[Int32, STRIP_COLUMNS](fill=0)
+        var e = InlineArray[Int32, STRIP_COLUMNS](fill=0)
+        comptime for k in range(STRIP_COLUMNS):
+            comptime if mode == AlignmentMode.GLOBAL:
+                h[k] = scoring.open + Int32(first_column + k) * scoring.extend
+            e[k] = h[k] + scoring.open + scoring.extend
 
-            wavefront.scores_current[unsafe_offset=row] = cell
-            wavefront.deletes_current[unsafe_offset=row] = deletion
-            wavefront.inserts_current[unsafe_offset=row] = insertion
+        # Lane `t` reads these from lane `t - 1`, which is why they hold row zero at the column
+        # just past this lane's last one rather than anything of this lane's own.
+        var past = first_column + STRIP_COLUMNS
+        var edge_h = Int32(0)
+        comptime if mode == AlignmentMode.GLOBAL:
+            edge_h = scoring.open + Int32(past - 1) * scoring.extend
+        var edge_i = edge_h + scoring.open + scoring.extend
 
+        # The diagonal needs no traffic of its own. Every lane shuffles before any lane advances,
+        # so the left value received one step ago is the row above the one received now.
+        var diagonal_carry = Int32(0)
+        comptime if mode == AlignmentMode.GLOBAL:
+            diagonal_carry = 0 if first_column == 0 else scoring.open + Int32(first_column - 1) * scoring.extend
+
+        for step in range(1, rows + STRIP_LANES + 1):
+            var row = step - lane
+            var left_h = shuffle_up(edge_h, 1)
+            var left_i = shuffle_up(edge_i, 1)
+            if lane == 0:
+                var here = min(max(row, 0), rows)
+                left_h = carry_h[unsafe_offset=here]
+                left_i = carry_i[unsafe_offset=here]
+            var left_h_above = diagonal_carry
+            diagonal_carry = left_h
+
+            if row >= 1 and row <= rows:
+                var symbol = Int(sequences[unsafe_offset=first_start + row - 1])
+                var diagonal = left_h_above
+                var running_h = left_h
+                var running_i = left_i
+                comptime for k in range(STRIP_COLUMNS):
+                    var substitution = Int32(table[unsafe_offset=symbol * width + Int(letters[k])])
+                    var computed = gotoh_cell[mode](diagonal, h[k], e[k], running_h, running_i, substitution, scoring)
+                    diagonal = h[k]
+                    h[k] = computed.score
+                    e[k] = computed.deletion
+                    running_h = computed.score
+                    running_i = computed.insertion
+                    comptime if mode == AlignmentMode.LOCAL:
+                        if k < owned:
+                            best = max(best, computed.score)
+                edge_h = running_h
+                edge_i = running_i
+                if lane == STRIP_LANES - 1 and owned > 0:
+                    carry_h[unsafe_offset=row] = h[STRIP_COLUMNS - 1]
+                    carry_i[unsafe_offset=row] = running_i
+                comptime if mode == AlignmentMode.GLOBAL:
+                    if row == rows and owned > 0 and first_column + owned == columns:
+                        results[unsafe_offset=pair] = h[owned - 1]
         barrier()
 
-        wavefront.rotate()
-
-    block_argmax(best_scores, best_places, best, best_place)
-
-    if thread_idx.x == 0:
-        var place = best_places[unsafe_offset=0]
-        outcome[unsafe_offset=0] = place // Int64(columns + 1)
-        outcome[unsafe_offset=1] = place % Int64(columns + 1)
-        outcome[unsafe_offset=2] = Int64(best_scores[unsafe_offset=0])
+    comptime if mode == AlignmentMode.LOCAL:
+        var highest = block.max[block_size=STRIP_LANES](best)
+        if thread_idx.x == 0:
+            results[unsafe_offset=pair] = highest
 
 
-# Subproblems at or below this many cells are solved outright rather than split. Small enough
-# that a leaf stays cheap, large enough that the recursion does not dominate.
-comptime DEFAULT_TILE_CELLS = 4096
+# One strip spans one tile exactly, so a tile needs no column carry of its own: its left edge
+# comes from the neighbouring tile's frontier and its right edge goes back out the same way.
+comptime TILE_SIDE = STRIP_WIDTH
 
-comptime TILE_SIDE = 256
+# Below this a tile spends more steps ramping the skew in and out than sweeping rows.
+comptime MIN_TILE_HEIGHT = 32
+
+# Warps a level aims to put in flight at once. Past roughly this many the strip stops gaining,
+# so further splitting only pays the skew ramp again.
+comptime TARGET_TILES = 4224
+
 
 # rows, columns, first_from, second_from, row_base, column_base, corner_base, entry, half,
-# tile_rows_count, tile_columns_count, local
-comptime SWEEP_PLAN_FIELDS = 12
+# tile_rows_count, tile_columns_count, local, tile_height
+comptime SWEEP_PLAN_FIELDS = 13
 
 
 def tiled_sweep_kernel(
@@ -1933,17 +1893,27 @@ def tiled_sweep_kernel(
     left_inserts: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
     corner_scores: Pointer[Scalar[SCORE_DTYPE], MutAnyOrigin],
     tile_diagonal: Int32,
+    widest_tiles: Int32,
     alphabet_size: Int32,
     open: Int32,
     extend: Int32,
 ):
-    """One tile per block, one tile-anti-diagonal per launch, every sweep of a level at once.
+    """One warp per tile, one tile-anti-diagonal per launch, every sweep of a level at once.
 
     Tiles sharing an anti-diagonal are independent, so a launch boundary supplies the barrier that
-    Mojo 1.0 has no grid-wide primitive for. `block_idx.y` selects one sweep out of the level's
-    plan, which is what lets independent subproblems share a launch instead of taking turns.
+    Mojo 1.0 has no grid-wide primitive for. The flat block index carries both the sweep and the
+    tile, which is what lets independent subproblems share a launch instead of taking turns. It is
+    flat rather than two-dimensional because a deep recursion level holds more sweeps than the
+    65535 a grid's second dimension allows.
+
+    Inside a tile the sweep is a skewed register strip: lane `t` owns `STRIP_COLUMNS` columns and
+    sits on row `s - t`, so the left-neighbour dependency travels by one `shuffle_up` and the tile
+    runs to completion without a single barrier.
     """
-    var plan = Int(block_idx.y) * SWEEP_PLAN_FIELDS
+    var lanes_wide = Int(widest_tiles)
+    var sweep_index = Int(block_idx.x) // lanes_wide
+    var tile_slot = Int(block_idx.x) % lanes_wide
+    var plan = sweep_index * SWEEP_PLAN_FIELDS
     var rows = Int(plans[unsafe_offset=plan + 0])
     var columns = Int(plans[unsafe_offset=plan + 1])
     var first_from = Int(plans[unsafe_offset=plan + 2])
@@ -1956,162 +1926,184 @@ def tiled_sweep_kernel(
     var tile_rows_count = Int(plans[unsafe_offset=plan + 9])
     var tile_columns_count = Int(plans[unsafe_offset=plan + 10])
     var local = Int(plans[unsafe_offset=plan + 11]) != 0
+    var tile_height = Int(plans[unsafe_offset=plan + 12])
     var corner_stride = tile_columns_count + 1
-    var slot = Int(block_idx.y) * Int(grid_dim.x) + Int(block_idx.x)
+    var slot = Int(block_idx.x)
 
     var tile_row_low = Int(tile_diagonal) - min(Int(tile_diagonal), tile_columns_count - 1)
     var tile_row_high = min(Int(tile_diagonal), tile_rows_count - 1)
-    var tile_row = tile_row_low + Int(block_idx.x)
+    var tile_row = tile_row_low + tile_slot
     if tile_row > tile_row_high:
         return
     var tile_column = Int(tile_diagonal) - tile_row
-    var row_begin = tile_row * TILE_SIDE
+    var row_begin = tile_row * tile_height
     var column_begin = tile_column * TILE_SIDE
-    var height = min(TILE_SIDE, rows - row_begin)
+    var height = min(tile_height, rows - row_begin)
     var width_span = min(TILE_SIDE, columns - column_begin)
     if height <= 0 or width_span <= 0:
         return
 
-    var best_cell = Int32(0)
-    var best_at = Int64(0)
+    var width = Int(alphabet_size)
+    var scoring = AffineGapCosts(open, extend)
+    var lane = Int(lane_id())
+    var first_column = lane * STRIP_COLUMNS
+    var owned = min(max(width_span - first_column, 0), STRIP_COLUMNS)
     var top_scores = reverse_scores if reversed_order else forward_scores
     var top_deletes = reverse_deletes if reversed_order else forward_deletes
-    var width = Int(alphabet_size)
-    var stride = TILE_SIDE + 1
-    var scoring = AffineGapCosts(open, extend)
 
-    var bands = stack_allocation[
-        BANDS_PER_SWEEP * (TILE_SIDE + 1), Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED
-    ]()
-    var scores_table = stack_allocation[
+    var table = stack_allocation[
         MAX_ALPHABET_SIZE * MAX_ALPHABET_SIZE,
         Scalar[SUBSTITUTION_DTYPE],
         address_space=AddressSpace.SHARED,
     ]()
     for index in range(Int(thread_idx.x), width * width, Int(block_dim.x)):
-        scores_table[unsafe_offset=index] = substitutions[unsafe_offset=index]
+        table[unsafe_offset=index] = substitutions[unsafe_offset=index]
+
+    # The tile's left column, staged once by the whole warp. Lane zero consumes one entry per
+    # step, and a global load there would sit on the dependency chain that feeds every shuffle.
+    # Staging also decouples the read of the neighbour's frontier from this tile's write of its
+    # own, which land in the same slots.
+    var edge_scores = stack_allocation[TILE_SIDE, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED]()
+    var edge_inserts = stack_allocation[TILE_SIDE, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED]()
+    for index in range(Int(thread_idx.x), height, Int(block_dim.x)):
+        var row = row_begin + index + 1
+        if column_begin == 0:
+            var border = Int32(0) if local else (Int32(row) * extend if extends else open + Int32(row - 1) * extend)
+            edge_scores[unsafe_offset=index] = border
+            edge_inserts[unsafe_offset=index] = border + open + extend
+        else:
+            edge_scores[unsafe_offset=index] = left_scores[unsafe_offset=row_base + row]
+            edge_inserts[unsafe_offset=index] = left_inserts[unsafe_offset=row_base + row]
     barrier()
 
-    var wavefront = Wavefront.over(bands, stride)
+    # The tile's top row, for the columns this lane owns. Outside the matrix it is the affine
+    # ramp, or zero for a local sweep; inside it is whatever the tile above left behind.
+    var symbols = InlineArray[Int32, STRIP_COLUMNS](fill=0)
+    var h = InlineArray[Int32, STRIP_COLUMNS](fill=0)
+    var e = InlineArray[Int32, STRIP_COLUMNS](fill=0)
+    comptime for k in range(STRIP_COLUMNS):
+        var column = column_begin + min(first_column + k, width_span - 1) + 1
+        var right_index = second_from + columns - column if reversed_order else second_from + column - 1
+        symbols[k] = Int32(sequences[unsafe_offset=right_index])
+        if local and row_begin == 0:
+            h[k] = 0
+            e[k] = open + extend
+        elif row_begin == 0:
+            h[k] = open + Int32(column - 1) * extend
+            e[k] = h[k] + open + extend
+        else:
+            h[k] = top_scores[unsafe_offset=column_base + column]
+            e[k] = top_deletes[unsafe_offset=column_base + column]
 
-    var last_diagonal = height + width_span
-    for diagonal in range(0, last_diagonal + 1):
-        var row_low = max(0, diagonal - width_span)
-        var row_high = min(height, diagonal)
+    var edge_h = h[STRIP_COLUMNS - 1]
+    var edge_i = edge_h + open + extend
 
-        for local_row in range(row_low + Int(thread_idx.x), row_high + 1, Int(block_dim.x)):
-            var local_column = diagonal - local_row
+    # The cell above and to the left of this lane's first one. For lane zero that is the tile's
+    # own corner; for every other lane it is a cell of the top row.
+    var diagonal_carry = Int32(0)
+    if lane == 0:
+        if local and (row_begin == 0 or column_begin == 0):
+            diagonal_carry = 0
+        elif row_begin == 0 and column_begin == 0:
+            diagonal_carry = 0
+        elif row_begin == 0:
+            diagonal_carry = open + Int32(column_begin - 1) * extend
+        elif column_begin == 0:
+            diagonal_carry = Int32(row_begin) * extend if extends else open + Int32(row_begin - 1) * extend
+        else:
+            diagonal_carry = corner_scores[unsafe_offset=corner_base + tile_row * corner_stride + tile_column]
+    else:
+        var column = column_begin + first_column
+        if local and row_begin == 0:
+            diagonal_carry = 0
+        elif row_begin == 0:
+            diagonal_carry = open + Int32(column - 1) * extend
+        else:
+            diagonal_carry = top_scores[unsafe_offset=column_base + column]
+
+    var best_cell = Int32(0)
+    var best_at = Int64(0)
+
+    for step in range(1, height + STRIP_LANES + 1):
+        var local_row = step - lane
+        var left_h = shuffle_up(edge_h, 1)
+        var left_i = shuffle_up(edge_i, 1)
+        if lane == 0:
+            var index = min(max(local_row, 1), height) - 1
+            left_h = edge_scores[unsafe_offset=index]
+            left_i = edge_inserts[unsafe_offset=index]
+        var left_h_above = diagonal_carry
+        diagonal_carry = left_h
+
+        if local_row >= 1 and local_row <= height:
             var row = row_begin + local_row
-            var column = column_begin + local_column
-            var cell = Int32(0)
-            var deletion = open + extend
-            var insertion = open + extend
-
-            if local_row == 0 or local_column == 0:
-                # A tile edge. Outside the matrix it is the affine ramp; inside it is whatever the
-                # neighbouring tile left behind.
-                if local and (row == 0 or column == 0):
-                    # A local sweep starts afresh on the matrix border only. An interior tile
-                    # edge still carries its neighbour's frontier.
-                    cell = 0
-                    deletion = open + extend
-                    insertion = deletion
-                elif row == 0 and column == 0:
-                    cell = 0
-                    deletion = open + extend
-                    insertion = deletion
-                elif row == 0:
-                    # The open run arrives at the corner only; elsewhere on the top row it ended.
-                    cell = open + Int32(column - 1) * extend
-                    deletion = cell + open + extend
-                    insertion = deletion
-                elif column == 0:
-                    cell = Int32(row) * extend if extends else open + Int32(row - 1) * extend
-                    deletion = cell
-                    insertion = cell + open + extend
-                elif local_row == 0 and local_column == 0:
-                    cell = corner_scores[
-                        unsafe_offset=corner_base + tile_row * corner_stride + tile_column
-                    ]
-                    deletion = cell + open + extend
-                    insertion = deletion
-                elif local_row == 0:
-                    cell = top_scores[unsafe_offset=column_base + column]
-                    deletion = top_deletes[unsafe_offset=column_base + column]
-                    insertion = cell + open + extend
-                else:
-                    cell = left_scores[unsafe_offset=row_base + row]
-                    insertion = left_inserts[unsafe_offset=row_base + row]
-                    deletion = cell + open + extend
-            else:
-                var left_index = first_from + rows - row if reversed_order else first_from + row - 1
-                var right_index = (
-                    second_from + columns - column if reversed_order else second_from + column - 1
-                )
-                var left_symbol = Int(sequences[unsafe_offset=left_index])
-                var right_symbol = Int(sequences[unsafe_offset=right_index])
-                var substitution = Int32(scores_table[unsafe_offset=left_symbol * width + right_symbol])
+            var left_index = first_from + rows - row if reversed_order else first_from + row - 1
+            var symbol = Int(sequences[unsafe_offset=left_index])
+            var diagonal = left_h_above
+            var running_h = left_h
+            var running_i = left_i
+            comptime for k in range(STRIP_COLUMNS):
+                var substitution = Int32(table[unsafe_offset=symbol * width + Int(symbols[k])])
                 var computed = gotoh_cell[AlignmentMode.GLOBAL](
-                    wavefront.scores_two_back[unsafe_offset=local_row - 1],
-                    wavefront.scores_one_back[unsafe_offset=local_row - 1],
-                    wavefront.deletes_one_back[unsafe_offset=local_row - 1],
-                    wavefront.scores_one_back[unsafe_offset=local_row],
-                    wavefront.inserts_one_back[unsafe_offset=local_row],
-                    substitution,
-                    scoring,
+                    diagonal, h[k], e[k], running_h, running_i, substitution, scoring
                 )
-                cell = computed.score
-                deletion = computed.deletion
-                insertion = computed.insertion
+                var cell = computed.score
                 if local and cell < 0:
                     cell = 0
-                if local and cell > best_cell:
+                if local and k < owned and cell > best_cell:
                     best_cell = cell
-                    best_at = Int64(row) * Int64(columns + 1) + Int64(column)
+                    best_at = Int64(row) * Int64(columns + 1) + Int64(column_begin + first_column + k + 1)
+                diagonal = h[k]
+                h[k] = cell
+                e[k] = computed.deletion
+                running_h = cell
+                running_i = computed.insertion
+            edge_h = running_h
+            edge_i = running_i
 
-            wavefront.scores_current[unsafe_offset=local_row] = cell
-            wavefront.deletes_current[unsafe_offset=local_row] = deletion
-            wavefront.inserts_current[unsafe_offset=local_row] = insertion
+            # A tile narrower than the full side is against the matrix's right edge, and nobody
+            # reads its right column, so the gate is exact rather than conservative.
+            if lane == STRIP_LANES - 1 and width_span == TILE_SIDE:
+                left_scores[unsafe_offset=row_base + row] = running_h
+                left_inserts[unsafe_offset=row_base + row] = running_i
+            if local_row == height:
+                # Column zero is the matrix border, so no lane computes it, but the crossing
+                # reduction reads it as a candidate cut. Only the leftmost tile may publish it;
+                # elsewhere that slot belongs to the tile on the left.
+                if lane == 0 and column_begin == 0:
+                    var border = Int32(0)
+                    var border_delete = open + extend
+                    if not local:
+                        border = Int32(row) * extend if extends else open + Int32(row - 1) * extend
+                        border_delete = border
+                    top_scores[unsafe_offset=column_base] = border
+                    top_deletes[unsafe_offset=column_base] = border_delete
+                comptime for k in range(STRIP_COLUMNS):
+                    if k < owned:
+                        var column = column_begin + first_column + k + 1
+                        top_scores[unsafe_offset=column_base + column] = h[k]
+                        top_deletes[unsafe_offset=column_base + column] = e[k]
+                if lane == STRIP_LANES - 1 and width_span == TILE_SIDE:
+                    corner_scores[unsafe_offset=corner_base + (tile_row + 1) * corner_stride + tile_column + 1] = h[
+                        STRIP_COLUMNS - 1
+                    ]
 
-            # Hand the tile's own edges to the neighbours, but only for cells this tile actually
-            # computed. Its own left edge carries a fabricated deletion and its own top edge a
-            # fabricated insertion; publishing either clobbers the true value the neighbouring
-            # tile wrote, and races with it, since the two share a tile-anti-diagonal. The matrix
-            # borders are genuine and do publish.
-            if local_row == height and (local_column > 0 or column == 0):
-                top_scores[unsafe_offset=column_base + column] = cell
-                top_deletes[unsafe_offset=column_base + column] = deletion
-            if local_column == width_span and (local_row > 0 or row == 0):
-                left_scores[unsafe_offset=row_base + row] = cell
-                left_inserts[unsafe_offset=row_base + row] = insertion
-            if local_row == height and local_column == width_span:
-                corner_scores[
-                    unsafe_offset=corner_base + (tile_row + 1) * corner_stride + tile_column + 1
-                ] = cell
-
-        barrier()
-
-        wavefront.rotate()
-
-    # A local sweep reports the best cell this block saw, for the host to reduce across blocks.
+    # A local sweep reports the best cell this warp saw, for the host to reduce across blocks.
     if local:
-        var best_scores = stack_allocation[
-            THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED
-        ]()
-        var best_places = stack_allocation[
-            THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED
-        ]()
-        block_argmax(best_scores, best_places, best_cell, best_at)
+        var span = UInt32(1)
+        while span < UInt32(STRIP_LANES):
+            var theirs = shuffle_xor(best_cell, span)
+            var their_place = shuffle_xor(best_at, span)
+            if theirs > best_cell or (theirs == best_cell and theirs != 0 and their_place < best_at):
+                best_cell = theirs
+                best_at = their_place
+            span *= 2
         if thread_idx.x == 0:
             # One launch per tile-anti-diagonal, so this slot accumulates rather than replaces.
-            var winner = best_scores[unsafe_offset=0]
-            var where = best_places[unsafe_offset=0]
             var held = block_best[unsafe_offset=slot]
-            if winner > held or (
-                winner == held and winner != 0 and where < block_place[unsafe_offset=slot]
-            ):
-                block_best[unsafe_offset=slot] = winner
-                block_place[unsafe_offset=slot] = where
+            if best_cell > held or (best_cell == held and best_cell != 0 and best_at < block_place[unsafe_offset=slot]):
+                block_best[unsafe_offset=slot] = best_cell
+                block_place[unsafe_offset=slot] = best_at
 
 
 @fieldwise_init
@@ -2156,18 +2148,10 @@ def crossing_kernel(
     var reverse_base = Int(joins[unsafe_offset=split * 3 + 1])
     var span = Int(joins[unsafe_offset=split * 3 + 2])
 
-    var plain_scores = stack_allocation[
-        THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED
-    ]()
-    var plain_places = stack_allocation[
-        THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED
-    ]()
-    var gapped_scores = stack_allocation[
-        THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED
-    ]()
-    var gapped_places = stack_allocation[
-        THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED
-    ]()
+    var plain_scores = stack_allocation[THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED]()
+    var plain_places = stack_allocation[THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED]()
+    var gapped_scores = stack_allocation[THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED]()
+    var gapped_places = stack_allocation[THREADS_PER_BLOCK, Scalar[DType.int64], address_space=AddressSpace.SHARED]()
 
     var best_plain = NEGATIVE_INFINITY
     var best_plain_column = Int64(0)
@@ -2180,9 +2164,7 @@ def crossing_kernel(
         if plain > best_plain:
             best_plain = plain
             best_plain_column = Int64(offset)
-        var gapped = (
-            forward_deletes[unsafe_offset=near] + reverse_deletes[unsafe_offset=far] + refund
-        )
+        var gapped = forward_deletes[unsafe_offset=near] + reverse_deletes[unsafe_offset=far] + refund
         if gapped > best_gapped:
             best_gapped = gapped
             best_gapped_column = Int64(offset)
@@ -2210,14 +2192,29 @@ struct Sweep(ImplicitlyCopyable, TrivialRegisterPassable):
     var half: SweepHalf
     var local: Bool
 
-    def tile_rows(self) -> Int:
-        return max((self.rows + TILE_SIDE - 1) // TILE_SIDE, 1)
+    def tile_height(self, sweeps_in_level: Int) -> Int:
+        """The tallest tile that still fills the machine, given how many sweeps share the level.
+
+        Concurrency is `sweeps_in_level * min(tile_rows, tile_columns)`, so shorter tiles buy
+        parallelism only until the machine is full; past that they cost skew, since a tile `h`
+        rows tall runs `h + 31` steps. Once `tile_columns` alone caps the anti-diagonal, the best
+        a height can do is make the grid square in count.
+        """
+        var wide = self.tile_columns()
+        var want = max(TARGET_TILES // max(sweeps_in_level, 1), 1)
+        var enough = min(want, wide)
+        var fair = (self.rows + enough - 1) // enough
+        return min(max(fair, MIN_TILE_HEIGHT), TILE_SIDE)
+
+    def tile_rows(self, sweeps_in_level: Int) -> Int:
+        var height = self.tile_height(sweeps_in_level)
+        return max((self.rows + height - 1) // height, 1)
 
     def tile_columns(self) -> Int:
         return max((self.columns + TILE_SIDE - 1) // TILE_SIDE, 1)
 
-    def tile_diagonals(self) -> Int:
-        return self.tile_rows() + self.tile_columns() - 1
+    def tile_diagonals(self, sweeps_in_level: Int) -> Int:
+        return self.tile_rows(sweeps_in_level) + self.tile_columns() - 1
 
 
 def sweep_level(
@@ -2245,7 +2242,7 @@ def sweep_level(
     var left_base = 0
     for index in range(len(sweeps)):
         var sweep = sweeps[index]
-        var tile_rows = sweep.tile_rows()
+        var tile_rows = sweep.tile_rows(len(sweeps))
         var tile_columns = sweep.tile_columns()
         var base = index * SWEEP_PLAN_FIELDS
         plan[base + 0] = Scalar[SCORE_DTYPE](sweep.rows)
@@ -2260,21 +2257,33 @@ def sweep_level(
         plan[base + 9] = Scalar[SCORE_DTYPE](tile_rows)
         plan[base + 10] = Scalar[SCORE_DTYPE](tile_columns)
         plan[base + 11] = Scalar[SCORE_DTYPE](Int(sweep.local))
+        plan[base + 12] = Scalar[SCORE_DTYPE](sweep.tile_height(len(sweeps)))
         corner_base += (tile_rows + 1) * (tile_columns + 1)
         sweeps[index].row_base = left_base
         sweeps[index].column_base = top_base
         left_base += sweep.rows + 2
         top_base += sweep.columns + 2
         widest_tiles = max(widest_tiles, min(tile_rows, tile_columns))
-        deepest = max(deepest, sweep.tile_diagonals())
+        deepest = max(deepest, sweep.tile_diagonals(len(sweeps)))
 
     if corner_base > buffers.corner_span or left_base > buffers.left_span or top_base > buffers.frontier_span:
         raise Error(
             String(
-                "Sweep scratch too small: corner ", corner_base, "/", buffers.corner_span,
-                " left ", left_base, "/", buffers.left_span,
-                " top ", top_base, "/", buffers.frontier_span,
-                " over ", len(sweeps), " sweeps",
+                "Sweep scratch too small: corner ",
+                corner_base,
+                "/",
+                buffers.corner_span,
+                " left ",
+                left_base,
+                "/",
+                buffers.left_span,
+                " top ",
+                top_base,
+                "/",
+                buffers.frontier_span,
+                " over ",
+                len(sweeps),
+                " sweeps",
             )
         )
 
@@ -2294,11 +2303,12 @@ def sweep_level(
             buffers.left_inserts.unsafe_ptr(),
             buffers.corner_scores.unsafe_ptr(),
             Int32(tile_diagonal),
+            Int32(widest_tiles),
             Int32(alphabet_size),
             scoring.open,
             scoring.extend,
-            grid_dim=(widest_tiles, len(sweeps)),
-            block_dim=THREADS_PER_BLOCK,
+            grid_dim=widest_tiles * len(sweeps),
+            block_dim=STRIP_LANES,
         )
     ctx.synchronize()
 
@@ -2721,14 +2731,19 @@ def sweep_buffers(
     Every sweep of a level claims its own slice, and a deep level is many tiny sweeps, so each
     array carries the real extent plus a constant per sweep. A level never holds more than two
     sweeps per row.
+
+    The column extent is doubled because a frame's forward and reverse halves split its rows but
+    both span all of its columns, so one level's sweeps cover the column axis twice.
     """
-    var frontier_span = columns + 4 * rows + 32
+    var frontier_span = 2 * columns + 4 * rows + 32
     var left_span = 5 * rows + 32
-    var tile_rows_count = (rows + TILE_SIDE - 1) // TILE_SIDE + 2
     var tile_columns_count = (columns + TILE_SIDE - 1) // TILE_SIDE + 2
-    var corner_span = tile_rows_count * tile_columns_count + 6 * rows + 32
+    # Square-in-count tiling makes a sweep's tile grid as wide as it is tall, and a level's
+    # frames partition the columns, so the corner arrays of one level are bounded by twice the
+    # square of the full column count.
+    var corner_span = 2 * tile_columns_count * tile_columns_count + 6 * rows + 32
     # Only a local scan writes here, and that is one sweep, so the grid is one tile-diagonal wide.
-    var block_slots = tile_rows_count + 4
+    var block_slots = min((rows + MIN_TILE_HEIGHT - 1) // MIN_TILE_HEIGHT, tile_columns_count) + 4
     var buffers = SweepBuffers(
         ctx.enqueue_create_buffer[SYMBOL_DTYPE](max(rows + columns, 1)),
         ctx.enqueue_create_buffer[SUBSTITUTION_DTYPE](len(substitutions)),
@@ -2770,9 +2785,7 @@ def device_local_extremum[
     Ties resolve to the earliest cell in row-major order, matching the reference scan.
     """
     var sweeps = List[Sweep]()
-    sweeps.append(
-        Sweep(first_to, second_to, 0, rows, 0, 0, GapRun.OPENS, half, True)
-    )
+    sweeps.append(Sweep(first_to, second_to, 0, rows, 0, 0, GapRun.OPENS, half, True))
     # Blocks that fall outside their sweep return without writing, and the buffers outlive the
     # scan, so anything left from an earlier one would be read as a candidate.
     ctx.enqueue_memset(buffers.block_best, Scalar[SCORE_DTYPE](0))
@@ -2781,7 +2794,7 @@ def device_local_extremum[
 
     var best = Int32(0)
     var best_place = Int64(0)
-    var slots = min(sweeps[0].tile_rows(), sweeps[0].tile_columns())
+    var slots = min(sweeps[0].tile_rows(len(sweeps)), sweeps[0].tile_columns())
     with buffers.block_best.map_to_host() as scores, buffers.block_place.map_to_host() as places:
         for slot in range(min(slots, buffers.block_slots)):
             var candidate = scores[slot]
@@ -2926,7 +2939,8 @@ def align_pair(
 ) raises -> PythonObject:
     """One pair, on the path its matrix can afford."""
     var cells = python_length(first) * python_length(second)
-    if cells > stored_budget:
+    var limit = min(stored_budget, DEVICE_STORED_CELLS) if executor == Executor.DEVICE else stored_budget
+    if cells > limit:
         if executor == Executor.DEVICE:
             if mode == AlignmentMode.LOCAL:
                 return smith_waterman_gotoh_alignment_linear_gpu(first, second, substitution, gaps)
@@ -2978,7 +2992,9 @@ def gotoh_alignments(
         if cells > widest:
             widest = cells
 
-    if executor == Executor.DEVICE and widest <= budget and pairs > 0:
+    # A batch of one is a single pair however it arrived, and gets the single pair's crossover.
+    var limit = budget if pairs > 1 else min(budget, DEVICE_STORED_CELLS)
+    if executor == Executor.DEVICE and widest <= limit and pairs > 0:
         comptime for index in range(len(ALL_MODES)):
             comptime candidate = ALL_MODES[index]
             if requested == candidate:
