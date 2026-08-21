@@ -375,18 +375,31 @@ def test_matches_reference(compiled_backend, mode: str, scoring: dict):
 
 @pytest.mark.repeat(10)
 @pytest.mark.parametrize("mode", MODES)
-def test_linear_space_matches_stored(compiled_backend, mode: str, monkeypatch):
+@pytest.mark.parametrize("scoring", SCORINGS)
+def test_linear_space_matches_stored(compiled_backend, mode: str, scoring: dict, monkeypatch):
     """The linear-space traceback must reach the same answer as a stored decision matrix.
 
     Both are compiled paths, so the budget constant is the seam that forces each; there is no
     public knob and the two are otherwise indistinguishable from outside.
+
+    The pair is long enough to split several times. A short one bottoms out in a single leaf and
+    is solved by the same code either way, so it never exercises the join at all.
+
+    Once the recursion really splits, the two need not return the same string: where several
+    alignments tie, which one a divide-and-conquer join lands on is not the one a single backward
+    walk lands on. What both must agree on is the score, and each must return a path that earns it.
     """
-    first, second = random_pair()
+    first, second = random_pair(shortest=140, longest=260)
     monkeypatch.setattr(affinegaps, "_STORED_MATRIX_BUDGET", 10**12)
-    stored = aligner_for(mode)(first, second, **SCORING, **compiled_backend)
+    stored = aligner_for(mode)(first, second, **scoring, **compiled_backend)
     monkeypatch.setattr(affinegaps, "_STORED_MATRIX_BUDGET", 0)
-    linear = aligner_for(mode)(first, second, **SCORING, **compiled_backend)
-    assert linear == stored
+    linear = aligner_for(mode)(first, second, **scoring, **compiled_backend)
+    assert linear[2] == stored[2] == scorer_for(mode)(first, second, **scoring, backend="python")
+    for gapped_first, gapped_second, score in (stored, linear):
+        assert len(gapped_first) == len(gapped_second)
+        assert gapped_first.replace("-", "") in first
+        assert gapped_second.replace("-", "") in second
+        assert rescore(gapped_first, gapped_second, scoring) == score
 
 
 @pytest.mark.parametrize("mode", MODES)
