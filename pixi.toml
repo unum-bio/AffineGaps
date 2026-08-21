@@ -9,17 +9,42 @@ platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 readme = "README.md"
 version = "0.2.5"
 
+# What an installed copy needs. Everything below is a feature named after its counterpart in
+# `pyproject.toml`, so a group added there has one obvious place to land here.
 [dependencies]
 max = ">=26.5,<27"
 mojo = ">=1.0.0,<2"
 numpy = ">=2.0"
 python = "3.12.*"
 
-[pypi-dependencies]
+# `[project.optional-dependencies]`
+[feature.color.dependencies]
+colorama = "*"
+
+[feature.numba.dependencies]
+numba = ">=0.67.0,<0.68"
+
+# `[dependency-groups]`
+[feature.lint.dependencies]
+black = ">=26"
+mypy = ">=2"
+ruff = ">=0.15"
+
+[feature.test.pypi-dependencies]
 biopython = "*"
 pytest = "*"
 pytest-repeat = "*"
 stringzilla = "*"
+
+# One environment holding every feature: a backend left out of it is a backend whose tests skip
+# without failing, which is how NumBa went unexercised.
+[environments]
+default = ["color", "numba", "lint", "test"]
+
+# A matching interpreter version makes `~/.local` visible inside the environment, where a stray
+# user-site install shadows the pinned one.
+[activation.env]
+PYTHONNOUSERSITE = "1"
 
 [tasks]
 # Mojo refuses to emit a shared library from a file defining `main`, so the region is stripped first.

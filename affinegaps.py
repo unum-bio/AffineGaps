@@ -65,9 +65,8 @@ __version__ = "0.2.5"
 
 # region Backends
 
-# Above this many cells the stored decision matrix stops being affordable, and the traceback
-# switches to the linear-space recursion. Both produce identical output, so this is purely a
-# memory-versus-recomputation trade. Five matrices at seventeen bytes a cell keeps it near 100 MB.
+# Above this many cells the traceback switches to the linear-space recursion, which produces
+# identical output. Five matrices at seventeen bytes a cell keeps a stored alignment near 100 MB.
 _STORED_MATRIX_BUDGET = 6_000_000
 
 # Which compiled entry point serves each combination. The batched device functions take parallel
@@ -104,6 +103,8 @@ def available(backend: str = "mojo", device: str = "cpu") -> bool:
     """
     if backend == "numpy":
         return device == "cpu"
+    if backend == "numba":
+        return device == "cpu" and HAS_NUMBA
     if _mojo_backend() is None:
         return False
     try:
@@ -113,6 +114,11 @@ def available(backend: str = "mojo", device: str = "cpu") -> bool:
     return True
 
 
+def _kernel(function, backend):
+    """The kernel body a backend asks for: NumBa's compiled dispatcher, or the Python it wrapped."""
+    return function if backend == "numba" else getattr(function, "py_func", function)
+
+
 def _resolve(backend, device):
     """Validates a backend and device pair, filling in whichever the caller left unspecified.
 
@@ -120,18 +126,22 @@ def _resolve(backend, device):
     would let a benchmark report the GPU while measuring the reference.
     """
     if backend is None and device is None:
-        for candidate in (("mojo", "gpu"), ("mojo", "cpu")):
+        for candidate in (("mojo", "gpu"), ("mojo", "cpu"), ("numba", "cpu")):
             if available(*candidate):
                 return candidate
         return ("numpy", "cpu")
     if backend is None:
-        backend = "numpy" if device == "cpu" and not available("mojo", "cpu") else "mojo"
+        backend = "mojo"
+        if device == "cpu" and not available("mojo", "cpu"):
+            backend = "numba" if HAS_NUMBA else "numpy"
     if device is None:
         device = "gpu" if backend == "mojo" and available("mojo", "gpu") else "cpu"
 
-    if backend == "numpy":
+    if backend in ("numpy", "numba"):
         if device != "cpu":
-            raise ValueError("The NumPy backend runs on the CPU only")
+            raise ValueError(f"The {backend} backend runs on the CPU only")
+        if backend == "numba" and not HAS_NUMBA:
+            raise RuntimeError("NumBa is not installed. Install the `numba` extra.")
         return (backend, device)
     if (backend, device) not in _COMPILED_SUFFIX:
         raise ValueError(f"Unknown backend {backend!r} or device {device!r}")
@@ -196,9 +206,6 @@ def _compiled_batch(name, backend, device, firsts, seconds, options):
 def _batch(name, backend, device, firsts, seconds, **options):
     """One batch entry point, on whichever backend resolves."""
     backend, device = _resolve(backend, device)
-    if backend == "numpy":
-        single = globals()[name]
-        return [single(a, b, **options) for a, b in zip(firsts, seconds, strict=True)]
     if device == "cpu":
         single = globals()[name]
         return [single(a, b, backend=backend, device=device, **options) for a, b in zip(firsts, seconds, strict=True)]
@@ -228,11 +235,13 @@ def smith_waterman_gotoh_scores(firsts, seconds, *, backend=None, device=None, *
 # endregion Backends
 
 
-# Define decorator to handle optional NumBa
 def jit_if_available(*jit_args, **jit_kwargs):
+    """Compiles with NumBa when it is installed, and leaves the function untouched when it is not."""
+
     def decorator(func):
         if HAS_NUMBA:
-            return nb.jit(*jit_args, **jit_kwargs)(func)
+            # Cached to disk, so only the first process on a machine pays the compile.
+            return nb.jit(*jit_args, cache=True, **jit_kwargs)(func)
         return func
 
     return decorator
@@ -604,7 +613,7 @@ def needleman_wunsch_gotoh_alignment(
     match: int | None = None,
     mismatch: int | None = None,
     *,
-    backend: Literal["numpy", "mojo"] | None = None,
+    backend: Literal["numpy", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> tuple[str, str, int]:
     """
@@ -640,7 +649,7 @@ def needleman_wunsch_gotoh_alignment(
     >>> print("Score:", score)
     """
     backend, device = _resolve(backend, device)
-    if backend != "numpy":
+    if backend == "mojo":
         return _compiled_call(
             "needleman_wunsch_gotoh_alignment",
             backend,
@@ -668,7 +677,7 @@ def needleman_wunsch_gotoh_alignment(
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
-    scores, changes, deletes, inserts = _needleman_wunsch_gotoh_kernel(
+    scores, changes, deletes, inserts = _kernel(_needleman_wunsch_gotoh_kernel, backend)(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
@@ -771,7 +780,7 @@ def needleman_wunsch_gotoh_score(
     match: int | None = None,
     mismatch: int | None = None,
     *,
-    backend: Literal["numpy", "mojo"] | None = None,
+    backend: Literal["numpy", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> int:
     """
@@ -807,7 +816,7 @@ def needleman_wunsch_gotoh_score(
     >>> print("Score:", score)
     """
     backend, device = _resolve(backend, device)
-    if backend != "numpy":
+    if backend == "mojo":
         return _compiled_call(
             "needleman_wunsch_gotoh_score",
             backend,
@@ -843,7 +852,7 @@ def needleman_wunsch_gotoh_score(
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
 
-    score = _needleman_wunsch_gotoh_score_kernel(
+    score = _kernel(_needleman_wunsch_gotoh_score_kernel, backend)(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
@@ -994,7 +1003,7 @@ def smith_waterman_gotoh_alignment(
     match: int | None = None,
     mismatch: int | None = None,
     *,
-    backend: Literal["numpy", "mojo"] | None = None,
+    backend: Literal["numpy", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> tuple[str, str, int]:
     """
@@ -1014,7 +1023,7 @@ def smith_waterman_gotoh_alignment(
     Tuple[str, str, int]: The optimal local alignment of the two sequences and the alignment score.
     """
     backend, device = _resolve(backend, device)
-    if backend != "numpy":
+    if backend == "mojo":
         return _compiled_call(
             "smith_waterman_gotoh_alignment",
             backend,
@@ -1042,7 +1051,7 @@ def smith_waterman_gotoh_alignment(
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
-    scores, changes, deletes, inserts, max_pos = _smith_waterman_gotoh_kernel(
+    scores, changes, deletes, inserts, max_pos = _kernel(_smith_waterman_gotoh_kernel, backend)(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
@@ -1145,7 +1154,7 @@ def smith_waterman_gotoh_score(
     match: int | None = None,
     mismatch: int | None = None,
     *,
-    backend: Literal["numpy", "mojo"] | None = None,
+    backend: Literal["numpy", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> int:
     """
@@ -1172,7 +1181,7 @@ def smith_waterman_gotoh_score(
     >>> print("Score:", score)
     """
     backend, device = _resolve(backend, device)
-    if backend != "numpy":
+    if backend == "mojo":
         return _compiled_call(
             "smith_waterman_gotoh_score",
             backend,
@@ -1201,7 +1210,7 @@ def smith_waterman_gotoh_score(
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
 
-    score = _smith_waterman_gotoh_score_kernel(
+    score = _kernel(_smith_waterman_gotoh_score_kernel, backend)(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,

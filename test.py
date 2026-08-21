@@ -97,6 +97,7 @@ def rescore(first: str, second: str, scoring: dict | None = None) -> int:
 # a device path, and Numba already has one in `numba.cuda`.
 ALL_BACKENDS = {
     "numpy-cpu": ("numpy", "cpu"),
+    "numba-cpu": ("numba", "cpu"),
     "mojo-cpu": ("mojo", "cpu"),
     "mojo-gpu": ("mojo", "gpu"),
 }
