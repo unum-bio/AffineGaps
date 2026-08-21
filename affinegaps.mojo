@@ -700,12 +700,11 @@ def sweep_bands[
 
     scores_above[0] = 0
     deletes_above[0] = scoring.open + scoring.extend
+    # An open run arrives at the top-left corner only. Reaching any other cell of the top row
+    # means the run already ended, so a deletion from there pays a fresh opening.
     for column in range(1, columns + 1):
         scores_above[column] = scoring.open + Int32(column - 1) * scoring.extend
-        if entry == GapRun.EXTENDS:
-            deletes_above[column] = scores_above[column]
-        else:
-            deletes_above[column] = scores_above[column] + scoring.open + scoring.extend
+        deletes_above[column] = scores_above[column] + scoring.open + scoring.extend
 
     for row in range(1, rows + 1):
         if entry == GapRun.EXTENDS:
@@ -771,12 +770,11 @@ def direct_tile(
     var inserts = List[Int32](length=cells, fill=Int32(0))
 
     scores[0] = 0
+    # An open run arrives at the top-left corner only. Reaching any other cell of the top row
+    # means the run already ended, so a deletion from there pays a fresh opening.
     for column in range(1, stride):
         scores[column] = scoring.open + Int32(column - 1) * scoring.extend
-        if top == GapRun.EXTENDS:
-            deletes[column] = scores[column]
-        else:
-            deletes[column] = scores[column] + scoring.open + scoring.extend
+        deletes[column] = scores[column] + scoring.open + scoring.extend
 
     for row in range(1, rows + 1):
         var base = row * stride
@@ -807,10 +805,10 @@ def direct_tile(
     var row = rows
     var column = columns
     var state = Layer.ALIGNING
+    # An open run at the bottom edge is a fact the join established, not a candidate to weigh:
+    # the two halves were scored on the assumption that this walk leaves in the deleting layer.
     if bottom == GapRun.EXTENDS:
-        var corner = row * stride + column
-        if deletes[corner] + scoring.extend - scoring.open > scores[corner]:
-            state = Layer.DELETING
+        state = Layer.DELETING
 
     # Only a row-consuming step records anything, so sibling subproblems tile the row axis.
     while row > 0 and column > 0:
@@ -1709,20 +1707,28 @@ def hirschberg_path_gpu(
     for index in range(columns):
         sequences.append(second[index])
 
+    # Every sweep of a level claims its own slice, and a deep level is many tiny sweeps, so each
+    # array carries the whole level: the real extent plus a constant per sweep, and a level never
+    # holds more than two sweeps per row.
+    var frontier_span = columns + 4 * rows + 32
+    var left_span = 5 * rows + 32
     var tile_rows_count = (rows + TILE_SIDE - 1) // TILE_SIDE + 2
     var tile_columns_count = (columns + TILE_SIDE - 1) // TILE_SIDE + 2
+    var corner_span = tile_rows_count * tile_columns_count + 6 * rows + 32
     var buffers = SweepBuffers(
         ctx.enqueue_create_buffer[SYMBOL_DTYPE](max(rows + columns, 1)),
         ctx.enqueue_create_buffer[SUBSTITUTION_DTYPE](len(substitutions)),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](columns + 2),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](columns + 2),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](columns + 2),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](columns + 2),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](frontier_span),
         ctx.enqueue_create_buffer[SCORE_DTYPE](4 * max(rows, 1)),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](rows + 2),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](rows + 2),
-        ctx.enqueue_create_buffer[SCORE_DTYPE](2 * tile_rows_count * tile_columns_count),
-        tile_rows_count * tile_columns_count,
+        ctx.enqueue_create_buffer[SCORE_DTYPE](left_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](left_span),
+        ctx.enqueue_create_buffer[SCORE_DTYPE](corner_span),
+        corner_span,
+        left_span,
+        frontier_span,
     )
 
     ctx.enqueue_copy(buffers.sequences, Span(sequences))
@@ -1763,7 +1769,7 @@ def hirschberg_path_gpu(
             break
 
         var sweeps = List[Sweep]()
-        var joins = List[Scalar[SCORE_DTYPE]](length=len(splitting) * 2, fill=0)
+        var joins = List[Scalar[SCORE_DTYPE]](length=len(splitting) * 3, fill=0)
         for index in range(len(splitting)):
             var frame = splitting[index]
             var split = (frame.first_from + frame.first_to) // 2
@@ -1783,11 +1789,13 @@ def hirschberg_path_gpu(
                     frame.bottom, SweepHalf.REVERSE,
                 )
             )
-            joins[index * 2] = Scalar[SCORE_DTYPE](frame.second_from)
-            joins[index * 2 + 1] = Scalar[SCORE_DTYPE](width)
+            joins[index * 3 + 2] = Scalar[SCORE_DTYPE](width)
 
         sweep_level(ctx, buffers, sweeps, alphabet_size, scoring)
 
+        for index in range(len(splitting)):
+            joins[index * 3] = Scalar[SCORE_DTYPE](sweeps[index * 2].column_base)
+            joins[index * 3 + 1] = Scalar[SCORE_DTYPE](sweeps[index * 2 + 1].column_base)
         var joins_buffer = upload(ctx, Span(joins))
         ctx.enqueue_function[crossing_kernel](
             buffers.top_scores.unsafe_ptr(),
@@ -1970,6 +1978,7 @@ def tiled_sweep_kernel(
     var reversed_order = Int(plans[unsafe_offset=plan + 8]) != 0
     var tile_rows_count = Int(plans[unsafe_offset=plan + 9])
     var tile_columns_count = Int(plans[unsafe_offset=plan + 10])
+    var corner_stride = tile_columns_count + 1
 
     var tile_row_low = Int(tile_diagonal) - min(Int(tile_diagonal), tile_columns_count - 1)
     var tile_row_high = min(Int(tile_diagonal), tile_rows_count - 1)
@@ -2025,8 +2034,9 @@ def tiled_sweep_kernel(
                     deletion = open + extend
                     insertion = deletion
                 elif row == 0:
+                    # The open run arrives at the corner only; elsewhere on the top row it ended.
                     cell = open + Int32(column - 1) * extend
-                    deletion = cell if extends else cell + open + extend
+                    deletion = cell + open + extend
                     insertion = deletion
                 elif column == 0:
                     cell = Int32(row) * extend if extends else open + Int32(row - 1) * extend
@@ -2034,7 +2044,7 @@ def tiled_sweep_kernel(
                     insertion = cell + open + extend
                 elif local_row == 0 and local_column == 0:
                     cell = corner_scores[
-                        unsafe_offset=corner_base + tile_row * tile_columns_count + tile_column
+                        unsafe_offset=corner_base + tile_row * corner_stride + tile_column
                     ]
                     deletion = cell + open + extend
                     insertion = deletion
@@ -2084,7 +2094,7 @@ def tiled_sweep_kernel(
                 left_inserts[unsafe_offset=row_base + row] = insertion
             if local_row == height and local_column == width_span:
                 corner_scores[
-                    unsafe_offset=corner_base + (tile_row + 1) * tile_columns_count + tile_column + 1
+                    unsafe_offset=corner_base + (tile_row + 1) * corner_stride + tile_column + 1
                 ] = cell
 
         barrier()
@@ -2106,8 +2116,10 @@ struct SweepBuffers(Movable):
     var left_scores: DeviceBuffer[SCORE_DTYPE]
     var left_inserts: DeviceBuffer[SCORE_DTYPE]
     var corner_scores: DeviceBuffer[SCORE_DTYPE]
-    # One corner region per concurrent sweep; the reverse half starts one span in.
+    # How much of each shared array a whole recursion level may claim.
     var corner_span: Int
+    var left_span: Int
+    var frontier_span: Int
 
 
 def crossing_kernel(
@@ -2125,8 +2137,9 @@ def crossing_kernel(
     thousands of nodes deep, so the reduction happens here and four numbers per split travel.
     """
     var split = Int(block_idx.x)
-    var column_base = Int(joins[unsafe_offset=split * 2])
-    var span = Int(joins[unsafe_offset=split * 2 + 1])
+    var forward_base = Int(joins[unsafe_offset=split * 3])
+    var reverse_base = Int(joins[unsafe_offset=split * 3 + 1])
+    var span = Int(joins[unsafe_offset=split * 3 + 2])
 
     var plain_scores = stack_allocation[
         THREADS_PER_BLOCK, Scalar[SCORE_DTYPE], address_space=AddressSpace.SHARED
@@ -2146,8 +2159,8 @@ def crossing_kernel(
     var best_gapped = NEGATIVE_INFINITY
     var best_gapped_column = Int64(0)
     for offset in range(Int(thread_idx.x), span + 1, Int(block_dim.x)):
-        var near = column_base + offset
-        var far = column_base + span - offset
+        var near = forward_base + offset
+        var far = reverse_base + span - offset
         var plain = forward_scores[unsafe_offset=near] + reverse_scores[unsafe_offset=far]
         if plain > best_plain:
             best_plain = plain
@@ -2194,7 +2207,7 @@ struct Sweep(ImplicitlyCopyable, TrivialRegisterPassable):
 def sweep_level(
     ctx: DeviceContext,
     mut buffers: SweepBuffers,
-    sweeps: List[Sweep],
+    mut sweeps: List[Sweep],
     alphabet_size: Int,
     scoring: AffineGapCosts,
 ) raises:
@@ -2212,8 +2225,10 @@ def sweep_level(
     var widest_tiles = 1
     var deepest = 0
     var corner_base = 0
+    var top_base = 0
+    var left_base = 0
     for index in range(len(sweeps)):
-        ref sweep = sweeps[index]
+        var sweep = sweeps[index]
         var tile_rows = sweep.tile_rows()
         var tile_columns = sweep.tile_columns()
         var base = index * SWEEP_PLAN_FIELDS
@@ -2221,16 +2236,23 @@ def sweep_level(
         plan[base + 1] = Scalar[SCORE_DTYPE](sweep.columns)
         plan[base + 2] = Scalar[SCORE_DTYPE](sweep.first_from)
         plan[base + 3] = Scalar[SCORE_DTYPE](sweep.second_from)
-        plan[base + 4] = Scalar[SCORE_DTYPE](sweep.row_base)
-        plan[base + 5] = Scalar[SCORE_DTYPE](sweep.column_base)
+        plan[base + 4] = Scalar[SCORE_DTYPE](left_base)
+        plan[base + 5] = Scalar[SCORE_DTYPE](top_base)
         plan[base + 6] = Scalar[SCORE_DTYPE](corner_base)
         plan[base + 7] = Scalar[SCORE_DTYPE](Int(sweep.entry == GapRun.EXTENDS))
         plan[base + 8] = Scalar[SCORE_DTYPE](Int(sweep.half == SweepHalf.REVERSE))
         plan[base + 9] = Scalar[SCORE_DTYPE](tile_rows)
-        plan[base + 10] = Scalar[SCORE_DTYPE](tile_columns + 1)
+        plan[base + 10] = Scalar[SCORE_DTYPE](tile_columns)
         corner_base += (tile_rows + 1) * (tile_columns + 1)
+        sweeps[index].row_base = left_base
+        sweeps[index].column_base = top_base
+        left_base += sweep.rows + 2
+        top_base += sweep.columns + 2
         widest_tiles = max(widest_tiles, min(tile_rows, tile_columns))
         deepest = max(deepest, sweep.tile_diagonals())
+
+    if corner_base > buffers.corner_span or left_base > buffers.left_span or top_base > buffers.frontier_span:
+        raise Error("Sweep frontier scratch is too small for this recursion level.")
 
     var plan_buffer = upload(ctx, Span(plan))
     for tile_diagonal in range(deepest):
