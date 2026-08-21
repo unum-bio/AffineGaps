@@ -60,6 +60,7 @@ SCORINGS = [
     pytest.param(costs(5, -4, -20, -1), id="expensive-gap"),
     pytest.param(costs(2, -1, -2, -1), id="cheap-gap"),
     pytest.param(costs(0, -1, -1, -1), id="unit-cost"),
+    pytest.param(costs(1, -1, -5, 0), id="free-extension"),
 ]
 SCORING = SCORINGS[0].values[0]
 
@@ -186,7 +187,8 @@ def test_score_matches_alignment(backend, mode: str, scoring: dict):
 
 @pytest.mark.repeat(20)
 @pytest.mark.parametrize("mode", MODES)
-def test_alignment_achieves_its_score(backend, mode: str):
+@pytest.mark.parametrize("scoring", SCORINGS)
+def test_alignment_achieves_its_score(backend, mode: str, scoring: dict):
     """Every returned path must be well formed and must realize the score reported beside it.
 
     With affine gaps neither is automatic. A walk that reads only the winning operation at each
@@ -195,11 +197,11 @@ def test_alignment_achieves_its_score(backend, mode: str):
     part of the alignment.
     """
     first, second = random_pair()
-    gapped_first, gapped_second, score = aligner_for(mode)(first, second, **SCORING, **backend)
+    gapped_first, gapped_second, score = aligner_for(mode)(first, second, **scoring, **backend)
     assert len(gapped_first) == len(gapped_second)
     assert gapped_first.replace("-", "") in first
     assert gapped_second.replace("-", "") in second
-    assert rescore(gapped_first, gapped_second) == score
+    assert rescore(gapped_first, gapped_second, scoring) == score
 
 
 @pytest.mark.repeat(20)
@@ -362,11 +364,12 @@ def test_against_biopython_fuzzy(backend, mode: str):
 
 @pytest.mark.repeat(15)
 @pytest.mark.parametrize("mode", MODES)
-def test_matches_reference(compiled_backend, mode: str):
+@pytest.mark.parametrize("scoring", SCORINGS)
+def test_matches_reference(compiled_backend, mode: str, scoring: dict):
     """A compiled backend must return exactly what the reference returns, strings included."""
     first, second = random_pair()
-    assert aligner_for(mode)(first, second, **SCORING, **compiled_backend) == aligner_for(mode)(
-        first, second, **SCORING, backend="python"
+    assert aligner_for(mode)(first, second, **scoring, **compiled_backend) == aligner_for(mode)(
+        first, second, **scoring, backend="python"
     )
 
 
@@ -386,15 +389,20 @@ def test_linear_space_matches_stored(compiled_backend, mode: str, monkeypatch):
     assert linear == stored
 
 
-def test_linear_space_beats_the_stored_limit(compiled_backend, monkeypatch):
-    """Linear space must carry a pair far past what a stored matrix could hold."""
+@pytest.mark.parametrize("mode", MODES)
+def test_linear_space_beats_the_stored_limit(compiled_backend, mode: str, monkeypatch):
+    """Linear space must carry a pair far past what a stored matrix could hold.
+
+    A global path spans both sequences; a local one spans a substring of each, which is the only
+    difference between the two modes here.
+    """
     monkeypatch.setattr(affinegaps, "_STORED_MATRIX_BUDGET", 0)
     alphabet = default_proteins_alphabet
     first = "".join(choice(alphabet) for _ in range(3000))
     second = "".join(choice(alphabet) for _ in range(3000))
-    gapped_first, gapped_second, score = needleman_wunsch_gotoh_alignment(first, second, **SCORING, **compiled_backend)
-    assert gapped_first.replace("-", "") == first
-    assert gapped_second.replace("-", "") == second
+    gapped_first, gapped_second, score = aligner_for(mode)(first, second, **SCORING, **compiled_backend)
+    assert gapped_first.replace("-", "") in first
+    assert gapped_second.replace("-", "") in second
     assert rescore(gapped_first, gapped_second) == score
 
 
