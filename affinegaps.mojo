@@ -2159,21 +2159,26 @@ def optional_int(value: PythonObject) -> Optional[Int]:
         return None
 
 
-def scoring_from(gap_opening: PythonObject, gap_extension: PythonObject) -> AffineScoring:
-    """Applies the defaults of `_validate_gotoh_arguments` to the two gap penalties."""
-    var opening = optional_int(gap_opening).or_else(Int(DEFAULT_GAP_OPENING))
-    var extension = optional_int(gap_extension).or_else(Int(DEFAULT_GAP_EXTENSION))
+def scoring_from(gaps: PythonObject) raises -> AffineScoring:
+    """Reads the two gap penalties off a caller's gap-cost record by name."""
+    var opening = optional_int(gaps.open).or_else(Int(DEFAULT_GAP_OPENING))
+    var extension = optional_int(gaps.extend).or_else(Int(DEFAULT_GAP_EXTENSION))
     return AffineScoring(Int32(opening), Int32(extension))
 
 
-def matrix_from(
-    match_score: PythonObject, mismatch_score: PythonObject, alphabet_size: Int
-) raises -> List[Scalar[SUBSTITUTION_DTYPE]]:
-    """BLOSUM62 unless both `match` and `mismatch` are supplied, mirroring the Python."""
-    var given_match = optional_int(match_score)
-    var given_mismatch = optional_int(mismatch_score)
-    if Bool(given_match) != Bool(given_mismatch):
-        raise Error("Both match and mismatch must be provided.")
+def matrix_from(substitution: PythonObject, alphabet_size: Int) raises -> List[Scalar[SUBSTITUTION_DTYPE]]:
+    """BLOSUM62 unless the caller passed a uniform-cost record.
+
+    No record at all means the default table. A tabulated record never reaches here, because the
+    caller refuses it before the boundary; these kernels carry only the default.
+    """
+    var given_match: Optional[Int] = None
+    var given_mismatch: Optional[Int] = None
+    try:
+        given_match = optional_int(substitution.match)
+        given_mismatch = optional_int(substitution.mismatch)
+    except:
+        return default_proteins_matrix()
     if not given_match:
         return default_proteins_matrix()
     return uniform_matrix(alphabet_size, given_match.value(), given_mismatch.value())
@@ -2184,15 +2189,13 @@ def gotoh_score[
 ](
     first: PythonObject,
     second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
 ) raises -> PythonObject:
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gap_opening, gap_extension)
-    var substitutions = matrix_from(match_score, mismatch_score, alphabet_size)
+    var scoring = scoring_from(gaps)
+    var substitutions = matrix_from(substitution, alphabet_size)
     var left = translate(String(first), alphabet)
     var right = translate(String(second), alphabet)
     return PythonObject(Int(serial_score[mode](left, right, substitutions, alphabet_size, scoring)))
@@ -2203,15 +2206,13 @@ def gotoh_alignment[
 ](
     first: PythonObject,
     second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
 ) raises -> PythonObject:
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gap_opening, gap_extension)
-    var substitutions = matrix_from(match_score, mismatch_score, alphabet_size)
+    var scoring = scoring_from(gaps)
+    var substitutions = matrix_from(substitution, alphabet_size)
     var left = translate(String(first), alphabet)
     var right = translate(String(second), alphabet)
     var result = serial_align[mode](left, right, substitutions, alphabet_size, scoring, alphabet)
@@ -2220,58 +2221,6 @@ def gotoh_alignment[
     triple.append(PythonObject(result.second_gapped))
     triple.append(PythonObject(Int(result.score)))
     return triple
-
-
-def needleman_wunsch_gotoh_score(
-    first: PythonObject,
-    second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
-) raises -> PythonObject:
-    return gotoh_score[AlignmentMode.GLOBAL](
-        first, second, gap_opening, gap_extension, match_score, mismatch_score
-    )
-
-
-def smith_waterman_gotoh_score(
-    first: PythonObject,
-    second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
-) raises -> PythonObject:
-    return gotoh_score[AlignmentMode.LOCAL](
-        first, second, gap_opening, gap_extension, match_score, mismatch_score
-    )
-
-
-def needleman_wunsch_gotoh_alignment(
-    first: PythonObject,
-    second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
-) raises -> PythonObject:
-    return gotoh_alignment[AlignmentMode.GLOBAL](
-        first, second, gap_opening, gap_extension, match_score, mismatch_score
-    )
-
-
-def smith_waterman_gotoh_alignment(
-    first: PythonObject,
-    second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
-) raises -> PythonObject:
-    return gotoh_alignment[AlignmentMode.LOCAL](
-        first, second, gap_opening, gap_extension, match_score, mismatch_score
-    )
 
 
 def python_length(value: PythonObject) raises -> Int:
@@ -2283,16 +2232,14 @@ def gotoh_scores_batch[
 ](
     firsts: PythonObject,
     seconds: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
 ) raises -> PythonObject:
     """Scores a whole batch on the GPU, one thread block per pair."""
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gap_opening, gap_extension)
-    var substitutions = matrix_from(match_score, mismatch_score, alphabet_size)
+    var scoring = scoring_from(gaps)
+    var substitutions = matrix_from(substitution, alphabet_size)
 
     var pairs = python_length(firsts)
     if pairs != python_length(seconds):
@@ -2323,47 +2270,19 @@ def gotoh_scores_batch[
     return output
 
 
-def needleman_wunsch_gotoh_scores_gpu(
-    firsts: PythonObject,
-    seconds: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
-) raises -> PythonObject:
-    return gotoh_scores_batch[AlignmentMode.GLOBAL](
-        firsts, seconds, gap_opening, gap_extension, match_score, mismatch_score
-    )
-
-
-def smith_waterman_gotoh_scores_gpu(
-    firsts: PythonObject,
-    seconds: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
-) raises -> PythonObject:
-    return gotoh_scores_batch[AlignmentMode.LOCAL](
-        firsts, seconds, gap_opening, gap_extension, match_score, mismatch_score
-    )
-
-
 def gotoh_alignments_batch[
     mode: AlignmentMode
 ](
     firsts: PythonObject,
     seconds: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
 ) raises -> PythonObject:
     """Aligns a whole batch on the GPU, returning `[first_gapped, second_gapped, score]` triples."""
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gap_opening, gap_extension)
-    var substitutions = matrix_from(match_score, mismatch_score, alphabet_size)
+    var scoring = scoring_from(gaps)
+    var substitutions = matrix_from(substitution, alphabet_size)
 
     var pairs = python_length(firsts)
     if pairs != python_length(seconds):
@@ -2396,32 +2315,6 @@ def gotoh_alignments_batch[
         triple.append(PythonObject(Int(aligned[index].score)))
         output.append(triple)
     return output
-
-
-def needleman_wunsch_gotoh_alignments_gpu(
-    firsts: PythonObject,
-    seconds: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
-) raises -> PythonObject:
-    return gotoh_alignments_batch[AlignmentMode.GLOBAL](
-        firsts, seconds, gap_opening, gap_extension, match_score, mismatch_score
-    )
-
-
-def smith_waterman_gotoh_alignments_gpu(
-    firsts: PythonObject,
-    seconds: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
-) raises -> PythonObject:
-    return gotoh_alignments_batch[AlignmentMode.LOCAL](
-        firsts, seconds, gap_opening, gap_extension, match_score, mismatch_score
-    )
 
 
 def combined_alphabet(first: String, second: String) -> String:
@@ -2486,10 +2379,8 @@ def colorize_alignment(first_gapped: PythonObject, second_gapped: PythonObject) 
 def needleman_wunsch_gotoh_alignment_linear(
     first: PythonObject,
     second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
 ) raises -> PythonObject:
     """Global alignment in linear space, splitting rows and joining halves Myers-Miller style.
 
@@ -2499,8 +2390,8 @@ def needleman_wunsch_gotoh_alignment_linear(
     """
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gap_opening, gap_extension)
-    var substitutions = matrix_from(match_score, mismatch_score, alphabet_size)
+    var scoring = scoring_from(gaps)
+    var substitutions = matrix_from(substitution, alphabet_size)
     var cells = DEFAULT_TILE_CELLS
     var left = translate(String(first), alphabet)
     var right = translate(String(second), alphabet)
@@ -2525,16 +2416,14 @@ def needleman_wunsch_gotoh_alignment_linear(
 def needleman_wunsch_gotoh_alignment_linear_gpu(
     first: PythonObject,
     second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
 ) raises -> PythonObject:
     """Global alignment in linear space with every sweep running on the device."""
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gap_opening, gap_extension)
-    var substitutions = matrix_from(match_score, mismatch_score, alphabet_size)
+    var scoring = scoring_from(gaps)
+    var substitutions = matrix_from(substitution, alphabet_size)
     var cells = DEFAULT_TILE_CELLS
     var left = translate(String(first), alphabet)
     var right = translate(String(second), alphabet)
@@ -2560,10 +2449,8 @@ def needleman_wunsch_gotoh_alignment_linear_gpu(
 def smith_waterman_gotoh_alignment_linear(
     first: PythonObject,
     second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
 ) raises -> PythonObject:
     """Local alignment in linear space, by reduction to the global problem.
 
@@ -2579,8 +2466,8 @@ def smith_waterman_gotoh_alignment_linear(
     """
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gap_opening, gap_extension)
-    var substitutions = matrix_from(match_score, mismatch_score, alphabet_size)
+    var scoring = scoring_from(gaps)
+    var substitutions = matrix_from(substitution, alphabet_size)
     var cells = DEFAULT_TILE_CELLS
     var left = translate(String(first), alphabet)
     var right = translate(String(second), alphabet)
@@ -2673,16 +2560,14 @@ def device_local_extremum[
 def smith_waterman_gotoh_alignment_linear_gpu(
     first: PythonObject,
     second: PythonObject,
-    gap_opening: PythonObject,
-    gap_extension: PythonObject,
-    match_score: PythonObject,
-    mismatch_score: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
 ) raises -> PythonObject:
     """Local alignment in linear space with every sweep running on the device."""
     var alphabet = String(DEFAULT_PROTEINS_ALPHABET)
     var alphabet_size = alphabet.byte_length()
-    var scoring = scoring_from(gap_opening, gap_extension)
-    var substitutions = matrix_from(match_score, mismatch_score, alphabet_size)
+    var scoring = scoring_from(gaps)
+    var substitutions = matrix_from(substitution, alphabet_size)
     var cells = DEFAULT_TILE_CELLS
     var left = translate(String(first), alphabet)
     var right = translate(String(second), alphabet)
@@ -2726,36 +2611,183 @@ def smith_waterman_gotoh_alignment_linear_gpu(
     return triple
 
 
+@fieldwise_init
+struct Executor(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
+    """Where a sweep runs."""
+
+    var identifier: UInt8
+    comptime HOST = Self(0)
+    comptime DEVICE = Self(1)
+
+
+def mode_from(value: PythonObject) raises -> AlignmentMode:
+    """Reads the alignment mode a caller named."""
+    var name = String(value)
+    if name == "global":
+        return AlignmentMode.GLOBAL
+    if name == "local":
+        return AlignmentMode.LOCAL
+    raise Error(String("Unknown alignment mode: ", name))
+
+
+def executor_from(value: PythonObject) raises -> Executor:
+    """Reads the device a caller named."""
+    var name = String(value)
+    if name == "cpu":
+        return Executor.HOST
+    if name == "gpu":
+        return Executor.DEVICE
+    raise Error(String("Unknown device: ", name))
+
+
+def paired_length(firsts: PythonObject, seconds: PythonObject) raises -> Int:
+    """The number of pairs, refusing two sides that do not line up."""
+    var pairs = python_length(firsts)
+    if pairs != python_length(seconds):
+        raise Error("Both sides of the batch must have the same length.")
+    return pairs
+
+
+def gotoh_scores(
+    firsts: PythonObject,
+    seconds: PythonObject,
+    mode: PythonObject,
+    device: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
+) raises -> PythonObject:
+    """Scores every pair. The score kernels are two-row, so linear space is the only space."""
+    var requested = mode_from(mode)
+    if executor_from(device) == Executor.DEVICE:
+        if requested == AlignmentMode.LOCAL:
+            return gotoh_scores_batch[AlignmentMode.LOCAL](
+                firsts, seconds, substitution, gaps
+            )
+        return gotoh_scores_batch[AlignmentMode.GLOBAL](
+            firsts, seconds, substitution, gaps
+        )
+
+    var results = Python().list()
+    for index in range(paired_length(firsts, seconds)):
+        if requested == AlignmentMode.LOCAL:
+            results.append(
+                gotoh_score[AlignmentMode.LOCAL](
+                    firsts[index], seconds[index], substitution, gaps
+                )
+            )
+        else:
+            results.append(
+                gotoh_score[AlignmentMode.GLOBAL](
+                    firsts[index], seconds[index], substitution, gaps
+                )
+            )
+    return results
+
+
+def align_pair(
+    first: PythonObject,
+    second: PythonObject,
+    mode: AlignmentMode,
+    executor: Executor,
+    stored_budget: Int,
+    substitution: PythonObject,
+    gaps: PythonObject,
+) raises -> PythonObject:
+    """One pair, on the path its matrix can afford."""
+    var cells = python_length(first) * python_length(second)
+    if cells > stored_budget:
+        if executor == Executor.DEVICE:
+            if mode == AlignmentMode.LOCAL:
+                return smith_waterman_gotoh_alignment_linear_gpu(
+                    first, second, substitution, gaps
+                )
+            return needleman_wunsch_gotoh_alignment_linear_gpu(
+                first, second, substitution, gaps
+            )
+        if mode == AlignmentMode.LOCAL:
+            return smith_waterman_gotoh_alignment_linear(
+                first, second, substitution, gaps
+            )
+        return needleman_wunsch_gotoh_alignment_linear(
+            first, second, substitution, gaps
+        )
+
+    if executor == Executor.DEVICE:
+        # No single-pair device entry exists for the stored traceback, so this is a batch of one.
+        var lefts = Python().list()
+        var rights = Python().list()
+        lefts.append(first)
+        rights.append(second)
+        if mode == AlignmentMode.LOCAL:
+            return gotoh_alignments_batch[AlignmentMode.LOCAL](
+                lefts, rights, substitution, gaps
+            )[0]
+        return gotoh_alignments_batch[AlignmentMode.GLOBAL](
+            lefts, rights, substitution, gaps
+        )[0]
+
+    if mode == AlignmentMode.LOCAL:
+        return gotoh_alignment[AlignmentMode.LOCAL](
+            first, second, substitution, gaps
+        )
+    return gotoh_alignment[AlignmentMode.GLOBAL](
+        first, second, substitution, gaps
+    )
+
+
+def gotoh_alignments(
+    firsts: PythonObject,
+    seconds: PythonObject,
+    mode: PythonObject,
+    device: PythonObject,
+    substitution: PythonObject,
+    gaps: PythonObject,
+    stored_budget: PythonObject,
+) raises -> PythonObject:
+    """Aligns every pair, taking the linear-space traceback once a matrix outgrows the budget.
+
+    A device batch whose every matrix fits goes out as one launch; anything else walks pair by
+    pair, because the two tracebacks cannot share a launch.
+    """
+    var requested = mode_from(mode)
+    var executor = executor_from(device)
+    var budget = Int(String(stored_budget))
+    var pairs = paired_length(firsts, seconds)
+
+    var widest = 0
+    for index in range(pairs):
+        var cells = python_length(firsts[index]) * python_length(seconds[index])
+        if cells > widest:
+            widest = cells
+
+    if executor == Executor.DEVICE and widest <= budget and pairs > 0:
+        if requested == AlignmentMode.LOCAL:
+            return gotoh_alignments_batch[AlignmentMode.LOCAL](
+                firsts, seconds, substitution, gaps
+            )
+        return gotoh_alignments_batch[AlignmentMode.GLOBAL](
+            firsts, seconds, substitution, gaps
+        )
+
+    var results = Python().list()
+    for index in range(pairs):
+        results.append(
+            align_pair(
+                firsts[index], seconds[index], requested, executor, budget,
+                substitution, gaps,
+            )
+        )
+    return results
+
+
 @export
 def PyInit_affinegaps_mojo() abi("C") -> PythonObject:
     try:
         var builder = PythonModuleBuilder("affinegaps_mojo")
-        builder.def_function[needleman_wunsch_gotoh_score]("needleman_wunsch_gotoh_score")
-        builder.def_function[smith_waterman_gotoh_score]("smith_waterman_gotoh_score")
-        builder.def_function[needleman_wunsch_gotoh_alignment]("needleman_wunsch_gotoh_alignment")
-        builder.def_function[smith_waterman_gotoh_alignment]("smith_waterman_gotoh_alignment")
-        builder.def_function[needleman_wunsch_gotoh_scores_gpu]("needleman_wunsch_gotoh_scores_gpu")
-        builder.def_function[smith_waterman_gotoh_scores_gpu]("smith_waterman_gotoh_scores_gpu")
-        builder.def_function[needleman_wunsch_gotoh_alignments_gpu](
-            "needleman_wunsch_gotoh_alignments_gpu"
-        )
-        builder.def_function[smith_waterman_gotoh_alignments_gpu](
-            "smith_waterman_gotoh_alignments_gpu"
-        )
+        builder.def_function[gotoh_scores]("gotoh_scores")
+        builder.def_function[gotoh_alignments]("gotoh_alignments")
         builder.def_function[levenshtein_alignment]("levenshtein_alignment")
         builder.def_function[colorize_alignment]("colorize_alignment")
-        builder.def_function[needleman_wunsch_gotoh_alignment_linear](
-            "needleman_wunsch_gotoh_alignment_linear"
-        )
-        builder.def_function[needleman_wunsch_gotoh_alignment_linear_gpu](
-            "needleman_wunsch_gotoh_alignment_linear_gpu"
-        )
-        builder.def_function[smith_waterman_gotoh_alignment_linear](
-            "smith_waterman_gotoh_alignment_linear"
-        )
-        builder.def_function[smith_waterman_gotoh_alignment_linear_gpu](
-            "smith_waterman_gotoh_alignment_linear_gpu"
-        )
         return builder.finalize()
     except error:
         abort(String("Failed to initialize affinegaps_mojo: ", error))

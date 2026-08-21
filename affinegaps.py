@@ -46,6 +46,8 @@ License: Apache 2.0
 
 import os
 import sys
+from dataclasses import dataclass
+from enum import StrEnum
 from functools import cache, lru_cache
 from typing import Any, Literal, cast
 from collections.abc import Callable
@@ -69,9 +71,44 @@ __version__ = "0.2.5"
 # identical output. Five matrices at seventeen bytes a cell keeps a stored alignment near 100 MB.
 _STORED_MATRIX_BUDGET = 6_000_000
 
-# Which compiled entry point serves each combination. The batched device functions take parallel
-# lists and return one result per pair, which the caller unwraps.
-_COMPILED_SUFFIX = {("mojo", "cpu"): "", ("mojo", "gpu"): "s_gpu"}
+
+class Algorithm(StrEnum):
+    """The four Gotoh entry points, named by what they compute rather than by symbol."""
+
+    GLOBAL_SCORE = "global-score"
+    GLOBAL_ALIGNMENT = "global-alignment"
+    LOCAL_SCORE = "local-score"
+    LOCAL_ALIGNMENT = "local-alignment"
+
+
+class Result(StrEnum):
+    """Whether an entry point returns a number or a pair of gapped strings and a number."""
+
+    SCORE = "score"
+    ALIGNMENT = "alignment"
+
+
+class Mode(StrEnum):
+    """Which of the two alignment problems the recurrence solves."""
+
+    GLOBAL = "global"
+    LOCAL = "local"
+
+
+@dataclass(frozen=True)
+class _Spec:
+    """Everything the dispatcher needs to serve one algorithm on any backend.
+
+    `reference` is the public function, so the batch path never looks a name up in module globals.
+    """
+
+    reference: Callable
+    result: Result
+    mode: Mode
+
+
+# The compiled module exports one entry point per result shape; every other axis is an argument.
+_COMPILED_ENTRY = {Result.SCORE: "gotoh_scores", Result.ALIGNMENT: "gotoh_alignments"}
 
 
 @lru_cache(maxsize=1)
@@ -143,93 +180,77 @@ def _resolve(backend, device):
         if backend == "numba" and not HAS_NUMBA:
             raise RuntimeError("NumBa is not installed. Install the `numba` extra.")
         return (backend, device)
-    if (backend, device) not in _COMPILED_SUFFIX:
+    if backend != "mojo" or device not in ("cpu", "gpu"):
         raise ValueError(f"Unknown backend {backend!r} or device {device!r}")
     if _mojo_backend() is None:
         raise RuntimeError("The Mojo backend is not built. See the README for how to build it.")
     return (backend, device)
 
 
-def _custom_scoring(substitution_alphabet, substitution_matrix) -> bool:
+def _custom_scoring(substitution) -> bool:
     """Whether the caller supplied a table the compiled backend does not carry.
 
-    Passing the defaults explicitly is not custom, which is what lets a caller name the alphabet
-    for readability without being pushed off the compiled path.
+    The compiled kernels hold the default matrix and can build a uniform one, so only an explicit
+    table is out of reach.
     """
-    if substitution_alphabet is not None and substitution_alphabet != default_proteins_alphabet:
-        return True
-    if substitution_matrix is None:
-        return False
-    return not np.array_equal(substitution_matrix, default_proteins_matrix)
+    return isinstance(substitution, TabulatedSubstitutionCosts)
 
 
-def _compiled_call(name, backend, device, first, second, options):
-    """Routes one pair to the compiled backend, choosing the entry point and unwrapping the result."""
-    if _custom_scoring(options.get("substitution_alphabet"), options.get("substitution_matrix")):
-        raise NotImplementedError(f"{name} on the {backend} backend needs match/mismatch or the default matrix")
-
-    scoring_only = name.endswith("_score")
-    suffix = _COMPILED_SUFFIX[(backend, device)]
-    opening = options.get("gap_opening")
-    extension = options.get("gap_extension")
-
-    if not scoring_only and len(first) * len(second) > _STORED_MATRIX_BUDGET:
-        # Too large to store a decision per cell, so take the linear-space traceback. Its entry
-        # points need concrete penalties rather than the None sentinel.
-        suffix = "_linear_gpu" if device == "gpu" else "_linear"
-        opening = default_gap_opening if opening is None else opening
-        extension = default_gap_extension if extension is None else extension
-
-    entry = getattr(_mojo_backend(), name + suffix)
-    arguments = (opening, extension, options.get("match"), options.get("mismatch"))
-    # The batched device entry points take parallel lists and return one result per pair.
-    outcome = entry([first], [second], *arguments)[0] if suffix == "s_gpu" else entry(first, second, *arguments)
-    return outcome if scoring_only else tuple(outcome)
+def _reject_custom_scoring(algorithm, backend, options):
+    """The compiled backends carry only the default table, plus a uniform match/mismatch pair."""
+    if _custom_scoring(options.get("substitution")):
+        raise NotImplementedError(f"{algorithm} on the {backend} backend needs match/mismatch or the default matrix")
 
 
-def _compiled_batch(name, backend, device, firsts, seconds, options):
-    """Routes a whole batch, which is what the device is for."""
-    if _custom_scoring(options.get("substitution_alphabet"), options.get("substitution_matrix")):
-        raise NotImplementedError(f"{name} on the {backend} backend needs match/mismatch or the default matrix")
-    entry = getattr(_mojo_backend(), name + _COMPILED_SUFFIX[(backend, device)])
-    outcome = entry(
-        list(firsts),
-        list(seconds),
-        options.get("gap_opening"),
-        options.get("gap_extension"),
-        options.get("match"),
-        options.get("mismatch"),
-    )
-    return [row if name.endswith("_score") else tuple(row) for row in outcome]
+def _compiled_call(algorithm, backend, device, first, second, options):
+    """Routes one pair to the compiled backend, where a single pair is a batch of one."""
+    return _compiled_batch(algorithm, backend, device, [first], [second], options)[0]
 
 
-def _batch(name, backend, device, firsts, seconds, **options):
+def _compiled_batch(algorithm, backend, device, firsts, seconds, options):
+    """Routes a whole batch, which is what the device is for.
+
+    The compiled side chooses between the stored and the linear traceback from `stored_budget`,
+    so the only axes crossing the boundary are the ones the caller actually named.
+    """
+    _reject_custom_scoring(algorithm, backend, options)
+    spec = _ALGORITHMS[algorithm]
+    entry = getattr(_mojo_backend(), _COMPILED_ENTRY[spec.result])
+    substitution = options.get("substitution")
+    gaps = options.get("gaps") or AffineGapCosts()
+    if spec.result is Result.SCORE:
+        return list(entry(list(firsts), list(seconds), spec.mode, device, substitution, gaps))
+    outcome = entry(list(firsts), list(seconds), spec.mode, device, substitution, gaps, _STORED_MATRIX_BUDGET)
+    return [tuple(row) for row in outcome]
+
+
+def _batch(algorithm, backend, device, firsts, seconds, **options):
     """One batch entry point, on whichever backend resolves."""
     backend, device = _resolve(backend, device)
     if device == "cpu":
-        single = globals()[name]
+        single = _ALGORITHMS[algorithm].reference
         return [single(a, b, backend=backend, device=device, **options) for a, b in zip(firsts, seconds, strict=True)]
-    return _compiled_batch(name, backend, device, firsts, seconds, options)
+    return _compiled_batch(algorithm, backend, device, firsts, seconds, options)
 
 
 def needleman_wunsch_gotoh_alignments(firsts, seconds, *, backend=None, device=None, **options):
     """Globally aligns a whole batch, one thread block per pair on the device."""
-    return _batch("needleman_wunsch_gotoh_alignment", backend, device, firsts, seconds, **options)
+    return _batch(Algorithm.GLOBAL_ALIGNMENT, backend, device, firsts, seconds, **options)
 
 
 def smith_waterman_gotoh_alignments(firsts, seconds, *, backend=None, device=None, **options):
     """Locally aligns a whole batch, one thread block per pair on the device."""
-    return _batch("smith_waterman_gotoh_alignment", backend, device, firsts, seconds, **options)
+    return _batch(Algorithm.LOCAL_ALIGNMENT, backend, device, firsts, seconds, **options)
 
 
 def needleman_wunsch_gotoh_scores(firsts, seconds, *, backend=None, device=None, **options):
     """Scores a whole batch globally, without reconstructing the alignments."""
-    return _batch("needleman_wunsch_gotoh_score", backend, device, firsts, seconds, **options)
+    return _batch(Algorithm.GLOBAL_SCORE, backend, device, firsts, seconds, **options)
 
 
 def smith_waterman_gotoh_scores(firsts, seconds, *, backend=None, device=None, **options):
     """Scores a whole batch locally, without reconstructing the alignments."""
-    return _batch("smith_waterman_gotoh_score", backend, device, firsts, seconds, **options)
+    return _batch(Algorithm.LOCAL_SCORE, backend, device, firsts, seconds, **options)
 
 
 # endregion Backends
@@ -241,7 +262,7 @@ def jit_if_available(*jit_args, **jit_kwargs):
     def decorator(func):
         if HAS_NUMBA:
             # Cached to disk, so only the first process on a machine pays the compile.
-            return nb.jit(*jit_args, cache=True, **jit_kwargs)(func)
+            return nb.jit(*jit_args, cache=True, nogil=True, **jit_kwargs)(func)
         return func
 
     return decorator
@@ -286,8 +307,39 @@ default_proteins_matrix = (
     * 5
 )
 # fmt: on
-default_gap_opening: int = -4 * 5
-default_gap_extension: int = int(-0.2 * 5)
+
+
+@dataclass(frozen=True)
+class AffineGapCosts:
+    """Gotoh's two-parameter gap model. Both penalties are negative."""
+
+    open: int = -4 * 5
+    extend: int = int(-0.2 * 5)
+
+    def __post_init__(self):
+        # Checked here rather than per call, so no backend can be handed a non-affine recurrence.
+        if self.open > self.extend:
+            raise ValueError("Opening a gap must not cost less than extending it.")
+
+
+@dataclass(frozen=True)
+class UniformSubstitutionCosts:
+    """One score for equal symbols and one for unequal, over any alphabet."""
+
+    match: int
+    mismatch: int
+
+
+@dataclass(frozen=True)
+class TabulatedSubstitutionCosts:
+    """A substitution matrix and the alphabet that indexes it."""
+
+    alphabet: str
+    matrix: np.ndarray
+
+
+# A closed pair rather than four loose parameters, so "a match score and a matrix" cannot be said.
+SubstitutionCosts = UniformSubstitutionCosts | TabulatedSubstitutionCosts
 
 
 def _reconstruct_alignment(
@@ -368,34 +420,25 @@ def _translate_sequence(seq: str, alphabet: str) -> np.ndarray:
 
 
 def _validate_gotoh_arguments(
-    substitution_alphabet: str | None = None,
-    substitution_matrix: np.ndarray | None = None,
-    gap_opening: int | None = None,
-    gap_extension: int | None = None,
-    match: int | None = None,
-    mismatch: int | None = None,
+    substitution: SubstitutionCosts | None = None,
+    gaps: AffineGapCosts | None = None,
 ) -> tuple[str, np.ndarray, int, int]:
-    """Internal method that validates the arguments for the Needleman-Wunsch algorithm."""
-    if (match is not None) != (mismatch is not None):
-        raise ValueError("Both match and mismatch must be provided.")
-    if (match is not None) and (substitution_matrix is not None):
-        raise ValueError("Cannot provide both match/mismatch and a substitution matrix.")
+    """Resolves the two cost records into the alphabet, table and penalties a kernel wants.
 
-    if substitution_alphabet is None:
-        substitution_alphabet = default_proteins_alphabet
-    if substitution_matrix is None:
-        if match is None:
-            substitution_matrix = default_proteins_matrix
-        else:
-            n = len(substitution_alphabet)
-            substitution_matrix = np.full((n, n), mismatch)
-            substitution_matrix[np.diag_indices(n)] = match
-    if gap_opening is None:
-        gap_opening = default_gap_opening
-    if gap_extension is None:
-        gap_extension = default_gap_extension
+    There is nothing left to validate. The pairing rules the flat parameters needed checking for
+    are carried by the types: a uniform cost cannot omit half of itself, and it cannot also be a
+    table.
+    """
+    gaps = gaps or AffineGapCosts()
+    if substitution is None:
+        return default_proteins_alphabet, default_proteins_matrix, gaps.open, gaps.extend
+    if isinstance(substitution, TabulatedSubstitutionCosts):
+        return substitution.alphabet, substitution.matrix, gaps.open, gaps.extend
 
-    return substitution_alphabet, substitution_matrix, gap_opening, gap_extension
+    width = len(default_proteins_alphabet)
+    matrix = np.full((width, width), substitution.mismatch)
+    matrix[np.diag_indices(width)] = substitution.match
+    return default_proteins_alphabet, matrix, gaps.open, gaps.extend
 
 
 @jit_if_available(nopython=True)
@@ -606,13 +649,9 @@ def _needleman_wunsch_gotoh_kernel(
 def needleman_wunsch_gotoh_alignment(
     str1: str,
     str2: str,
-    substitution_alphabet: str | None = None,
-    substitution_matrix: np.ndarray | None = None,
-    gap_opening: int | None = None,
-    gap_extension: int | None = None,
-    match: int | None = None,
-    mismatch: int | None = None,
     *,
+    substitution: SubstitutionCosts | None = None,
+    gaps: AffineGapCosts | None = None,
     backend: Literal["numpy", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> tuple[str, str, int]:
@@ -623,21 +662,16 @@ def needleman_wunsch_gotoh_alignment(
     Parameters:
     str1 (str): The first sequence to be aligned.
     str2 (str): The second sequence to be aligned.
-    substitution_alphabet (Optional[str]): The optional alphabet used for the substitution matrix.
-    substitution_matrix (Optional[np.ndarray]): The optional substitution matrix for scoring matches/mismatches.
-    gap_opening (Optional[int]): The penalty for opening a gap.
-    gap_extension (Optional[int]): The penalty for extending a gap.
-    match (Optional[int]): The score for a match, to compose the substitution matrix.
-    mismatch (Optional[int]): The score for a mismatch, to compose the substitution matrix.
+    substitution (Optional[SubstitutionCosts]): Uniform match and mismatch scores, or a table
+        with the alphabet indexing it. Defaults to BLOSUM62 scaled by five.
+    gaps (Optional[AffineGapCosts]): The penalties for opening and extending a gap.
 
     Returns:
     Tuple[str, str, int]: The optimal alignment of the two sequences and the alignment score.
 
     Default values:
-    >>> substitution_alphabet = "ARNDCQEGHILKMFPSTWYVBZX"
-    >>> substitution_matrix = BLOSUM62 * 5
-    >>> gap_opening = -20
-    >>> gap_extension = -1
+    >>> substitution = None  # BLOSUM62 * 5 over "ARNDCQEGHILKMFPSTWYVBZX"
+    >>> gaps = AffineGapCosts(open=-20, extend=-1)
 
     Example usage:
     >>> from affinegaps import needleman_wunsch_gotoh_alignment
@@ -651,28 +685,16 @@ def needleman_wunsch_gotoh_alignment(
     backend, device = _resolve(backend, device)
     if backend == "mojo":
         return _compiled_call(
-            "needleman_wunsch_gotoh_alignment",
+            Algorithm.GLOBAL_ALIGNMENT,
             backend,
             device,
             str1,
             str2,
-            dict(
-                substitution_alphabet=substitution_alphabet,
-                substitution_matrix=substitution_matrix,
-                gap_opening=gap_opening,
-                gap_extension=gap_extension,
-                match=match,
-                mismatch=mismatch,
-            ),
+            dict(substitution=substitution, gaps=gaps),
         )
 
     substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
-        substitution_alphabet=substitution_alphabet,
-        substitution_matrix=substitution_matrix,
-        gap_opening=gap_opening,
-        gap_extension=gap_extension,
-        match=match,
-        mismatch=mismatch,
+        substitution, gaps
     )
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
@@ -773,13 +795,9 @@ def _needleman_wunsch_gotoh_score_kernel(
 def needleman_wunsch_gotoh_score(
     str1: str,
     str2: str,
-    substitution_alphabet: str | None = None,
-    substitution_matrix: np.ndarray | None = None,
-    gap_opening: int | None = None,
-    gap_extension: int | None = None,
-    match: int | None = None,
-    mismatch: int | None = None,
     *,
+    substitution: SubstitutionCosts | None = None,
+    gaps: AffineGapCosts | None = None,
     backend: Literal["numpy", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> int:
@@ -790,21 +808,16 @@ def needleman_wunsch_gotoh_score(
     Parameters:
     str1 (str): The first sequence to be aligned.
     str2 (str): The second sequence to be aligned.
-    substitution_alphabet (Optional[str]): The optional alphabet used for the substitution matrix.
-    substitution_matrix (Optional[np.ndarray]): The optional substitution matrix for scoring matches/mismatches.
-    gap_opening (Optional[int]): The penalty for opening a gap.
-    gap_extension (Optional[int]): The penalty for extending a gap.
-    match (Optional[int]): The score for a match, to compose the substitution matrix.
-    mismatch (Optional[int]): The score for a mismatch, to compose the substitution matrix.
+    substitution (Optional[SubstitutionCosts]): Uniform match and mismatch scores, or a table
+        with the alphabet indexing it. Defaults to BLOSUM62 scaled by five.
+    gaps (Optional[AffineGapCosts]): The penalties for opening and extending a gap.
 
     Returns:
     int: The alignment score.
 
     Default values:
-    >>> substitution_alphabet = "ARNDCQEGHILKMFPSTWYVBZX"
-    >>> substitution_matrix = BLOSUM62 * 5
-    >>> gap_opening = -20
-    >>> gap_extension = -1
+    >>> substitution = None  # BLOSUM62 * 5 over "ARNDCQEGHILKMFPSTWYVBZX"
+    >>> gaps = AffineGapCosts(open=-20, extend=-1)
 
     Example usage:
     >>> from affinegaps import needleman_wunsch_gotoh_score
@@ -818,19 +831,12 @@ def needleman_wunsch_gotoh_score(
     backend, device = _resolve(backend, device)
     if backend == "mojo":
         return _compiled_call(
-            "needleman_wunsch_gotoh_score",
+            Algorithm.GLOBAL_SCORE,
             backend,
             device,
             str1,
             str2,
-            dict(
-                substitution_alphabet=substitution_alphabet,
-                substitution_matrix=substitution_matrix,
-                gap_opening=gap_opening,
-                gap_extension=gap_extension,
-                match=match,
-                mismatch=mismatch,
-            ),
+            dict(substitution=substitution, gaps=gaps),
         )
 
     # The inner loop must be the longer one, assuming the latency of calls
@@ -841,12 +847,7 @@ def needleman_wunsch_gotoh_score(
     #     if len(str1) > len(str2):
     #         str1, str2 = str2, str1
     substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
-        substitution_alphabet=substitution_alphabet,
-        substitution_matrix=substitution_matrix,
-        gap_opening=gap_opening,
-        gap_extension=gap_extension,
-        match=match,
-        mismatch=mismatch,
+        substitution, gaps
     )
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
@@ -996,13 +997,9 @@ def _smith_waterman_gotoh_kernel(
 def smith_waterman_gotoh_alignment(
     str1: str,
     str2: str,
-    substitution_alphabet: str | None = None,
-    substitution_matrix: np.ndarray | None = None,
-    gap_opening: int | None = None,
-    gap_extension: int | None = None,
-    match: int | None = None,
-    mismatch: int | None = None,
     *,
+    substitution: SubstitutionCosts | None = None,
+    gaps: AffineGapCosts | None = None,
     backend: Literal["numpy", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> tuple[str, str, int]:
@@ -1012,12 +1009,9 @@ def smith_waterman_gotoh_alignment(
     Parameters:
     str1 (str): The first sequence to be aligned.
     str2 (str): The second sequence to be aligned.
-    substitution_alphabet (Optional[str]): The optional alphabet used for the substitution matrix.
-    substitution_matrix (Optional[np.ndarray]): The optional substitution matrix for scoring matches/mismatches.
-    gap_opening (Optional[int]): The penalty for opening a gap.
-    gap_extension (Optional[int]): The penalty for extending a gap.
-    match (Optional[int]): The score for a match, to compose the substitution matrix.
-    mismatch (Optional[int]): The score for a mismatch, to compose the substitution matrix.
+    substitution (Optional[SubstitutionCosts]): Uniform match and mismatch scores, or a table
+        with the alphabet indexing it. Defaults to BLOSUM62 scaled by five.
+    gaps (Optional[AffineGapCosts]): The penalties for opening and extending a gap.
 
     Returns:
     Tuple[str, str, int]: The optimal local alignment of the two sequences and the alignment score.
@@ -1025,28 +1019,16 @@ def smith_waterman_gotoh_alignment(
     backend, device = _resolve(backend, device)
     if backend == "mojo":
         return _compiled_call(
-            "smith_waterman_gotoh_alignment",
+            Algorithm.LOCAL_ALIGNMENT,
             backend,
             device,
             str1,
             str2,
-            dict(
-                substitution_alphabet=substitution_alphabet,
-                substitution_matrix=substitution_matrix,
-                gap_opening=gap_opening,
-                gap_extension=gap_extension,
-                match=match,
-                mismatch=mismatch,
-            ),
+            dict(substitution=substitution, gaps=gaps),
         )
 
     substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
-        substitution_alphabet=substitution_alphabet,
-        substitution_matrix=substitution_matrix,
-        gap_opening=gap_opening,
-        gap_extension=gap_extension,
-        match=match,
-        mismatch=mismatch,
+        substitution, gaps
     )
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
@@ -1147,13 +1129,9 @@ def _smith_waterman_gotoh_score_kernel(
 def smith_waterman_gotoh_score(
     str1: str,
     str2: str,
-    substitution_alphabet: str | None = None,
-    substitution_matrix: np.ndarray | None = None,
-    gap_opening: int | None = None,
-    gap_extension: int | None = None,
-    match: int | None = None,
-    mismatch: int | None = None,
     *,
+    substitution: SubstitutionCosts | None = None,
+    gaps: AffineGapCosts | None = None,
     backend: Literal["numpy", "numba", "mojo"] | None = None,
     device: Literal["cpu", "gpu"] | None = None,
 ) -> int:
@@ -1163,12 +1141,9 @@ def smith_waterman_gotoh_score(
     Parameters:
     str1 (str): The first sequence to be aligned.
     str2 (str): The second sequence to be aligned.
-    substitution_alphabet (Optional[str]): The optional alphabet used for the substitution matrix.
-    substitution_matrix (Optional[np.ndarray]): The optional substitution matrix for scoring matches/mismatches.
-    gap_opening (Optional[int]): The penalty for opening a gap.
-    gap_extension (Optional[int]): The penalty for extending a gap.
-    match (Optional[int]): The score for a match, to compose the substitution matrix.
-    mismatch (Optional[int]): The score for a mismatch, to compose the substitution matrix.
+    substitution (Optional[SubstitutionCosts]): Uniform match and mismatch scores, or a table
+        with the alphabet indexing it. Defaults to BLOSUM62 scaled by five.
+    gaps (Optional[AffineGapCosts]): The penalties for opening and extending a gap.
 
     Returns:
     int: The highest alignment score.
@@ -1183,28 +1158,16 @@ def smith_waterman_gotoh_score(
     backend, device = _resolve(backend, device)
     if backend == "mojo":
         return _compiled_call(
-            "smith_waterman_gotoh_score",
+            Algorithm.LOCAL_SCORE,
             backend,
             device,
             str1,
             str2,
-            dict(
-                substitution_alphabet=substitution_alphabet,
-                substitution_matrix=substitution_matrix,
-                gap_opening=gap_opening,
-                gap_extension=gap_extension,
-                match=match,
-                mismatch=mismatch,
-            ),
+            dict(substitution=substitution, gaps=gaps),
         )
 
     substitution_alphabet, substitution_matrix, gap_opening, gap_extension = _validate_gotoh_arguments(
-        substitution_alphabet=substitution_alphabet,
-        substitution_matrix=substitution_matrix,
-        gap_opening=gap_opening,
-        gap_extension=gap_extension,
-        match=match,
-        mismatch=mismatch,
+        substitution, gaps
     )
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
@@ -1219,6 +1182,19 @@ def smith_waterman_gotoh_score(
     )
 
     return int(score)
+
+
+# region Dispatch Table
+
+# Defined here rather than beside the enums so `reference` binds the function object itself.
+_ALGORITHMS: dict[Algorithm, _Spec] = {
+    Algorithm.GLOBAL_SCORE: _Spec(needleman_wunsch_gotoh_score, Result.SCORE, Mode.GLOBAL),
+    Algorithm.LOCAL_SCORE: _Spec(smith_waterman_gotoh_score, Result.SCORE, Mode.LOCAL),
+    Algorithm.GLOBAL_ALIGNMENT: _Spec(needleman_wunsch_gotoh_alignment, Result.ALIGNMENT, Mode.GLOBAL),
+    Algorithm.LOCAL_ALIGNMENT: _Spec(smith_waterman_gotoh_alignment, Result.ALIGNMENT, Mode.LOCAL),
+}
+
+# endregion Dispatch Table
 
 
 def colorize_alignment(align1: str, align2: str, background: Literal["dark", "light"] = "dark") -> tuple[str, str]:
@@ -1297,13 +1273,13 @@ def main():
         "--gap-opening",
         type=int,
         default=None,
-        help=f"The penalty for opening a gap; uses {default_gap_opening} by default",
+        help=f"The penalty for opening a gap; uses {AffineGapCosts().open} by default",
     )
     parser.add_argument(
         "--gap-extension",
         type=int,
         default=None,
-        help=f"The penalty for extending a gap; uses {default_gap_extension} by default",
+        help=f"The penalty for extending a gap; uses {AffineGapCosts().extend} by default",
     )
     parser.add_argument(
         "--local",
@@ -1320,15 +1296,17 @@ def main():
     aligner = smith_waterman_gotoh_alignment if args.local else needleman_wunsch_gotoh_alignment
     placement = {"backend": "mojo", "device": "gpu"} if args.gpu else {}
     try:
-        align1, align2, score = aligner(
-            args.seq1,
-            args.seq2,
-            match=args.match,
-            mismatch=args.mismatch,
-            gap_opening=args.gap_opening,
-            gap_extension=args.gap_extension,
-            **placement,
+        substitution = None
+        if args.match is not None or args.mismatch is not None:
+            if args.match is None or args.mismatch is None:
+                raise ValueError("Both --match and --mismatch must be provided.")
+            substitution = UniformSubstitutionCosts(match=args.match, mismatch=args.mismatch)
+        defaults = AffineGapCosts()
+        gaps = AffineGapCosts(
+            open=defaults.open if args.gap_opening is None else args.gap_opening,
+            extend=defaults.extend if args.gap_extension is None else args.gap_extension,
         )
+        align1, align2, score = aligner(args.seq1, args.seq2, substitution=substitution, gaps=gaps, **placement)
     except Exception as exc:
         print("Error:", exc)
         exit(1)

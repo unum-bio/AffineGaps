@@ -24,6 +24,8 @@ import pytest
 from Bio import Align
 from Bio.Align import substitution_matrices
 
+import numpy as np
+
 import affinegaps
 from affinegaps import (
     needleman_wunsch_gotoh_alignment,
@@ -32,6 +34,9 @@ from affinegaps import (
     smith_waterman_gotoh_score,
     levenshtein_alignment,
     default_proteins_alphabet,
+    AffineGapCosts,
+    UniformSubstitutionCosts,
+    TabulatedSubstitutionCosts,
 )
 
 MODES = ["global", "local"]
@@ -40,12 +45,21 @@ MODES = ["global", "local"]
 # scaled to match or the comparison is vacuous.
 BLOSUM_SCALE = 5
 
+
+def costs(match: int, mismatch: int, open: int, extend: int) -> dict:
+    """The two cost records as keyword arguments, so a test can splat one scoring into any call."""
+    return {
+        "substitution": UniformSubstitutionCosts(match=match, mismatch=mismatch),
+        "gaps": AffineGapCosts(open=open, extend=extend),
+    }
+
+
 # One representative scoring per regime rather than a grid: a cheap gap, an expensive one, and
 # unit costs. The grids they replace were overlapping draws from the same family.
 SCORINGS = [
-    pytest.param({"match": 5, "mismatch": -4, "gap_opening": -20, "gap_extension": -1}, id="expensive-gap"),
-    pytest.param({"match": 2, "mismatch": -1, "gap_opening": -2, "gap_extension": -1}, id="cheap-gap"),
-    pytest.param({"match": 0, "mismatch": -1, "gap_opening": -1, "gap_extension": -1}, id="unit-cost"),
+    pytest.param(costs(5, -4, -20, -1), id="expensive-gap"),
+    pytest.param(costs(2, -1, -2, -1), id="cheap-gap"),
+    pytest.param(costs(0, -1, -1, -1), id="unit-cost"),
 ]
 SCORING = SCORINGS[0].values[0]
 
@@ -80,13 +94,13 @@ def rescore(first: str, second: str, scoring: dict | None = None) -> int:
         if left == "-" and right == "-":
             continue
         if left == "-":
-            total += scoring["gap_extension"] if in_first else scoring["gap_opening"]
+            total += scoring["gaps"].extend if in_first else scoring["gaps"].open
             in_first, in_second = True, False
         elif right == "-":
-            total += scoring["gap_extension"] if in_second else scoring["gap_opening"]
+            total += scoring["gaps"].extend if in_second else scoring["gaps"].open
             in_first, in_second = False, True
         else:
-            total += scoring["match"] if left == right else scoring["mismatch"]
+            total += scoring["substitution"].match if left == right else scoring["substitution"].mismatch
             in_first = in_second = False
     return total
 
@@ -206,7 +220,7 @@ def test_against_levenshtein(backend):
     """
     first, second = random_pair(3, 15)
     distance = levenshtein_alignment(first, second)[2]
-    unit = {"match": 0, "mismatch": -1, "gap_opening": -1, "gap_extension": -1}
+    unit = costs(0, -1, -1, -1)
     assert -needleman_wunsch_gotoh_score(first, second, **unit, **backend) == distance
 
 
@@ -219,7 +233,7 @@ def test_gap_expansions(backend):
     than mismatched. Without that precondition the recurrence may prefer to mismatch the filler and
     the width legitimately changes the score — which is a property of the scoring, not a bug.
     """
-    free_extension = {"match": 5, "mismatch": -10, "gap_opening": -1, "gap_extension": 0}
+    free_extension = costs(5, -10, -1, 0)
     first, second = random_pair(5, 15, alphabet="ACGT")
     cut = len(second) // 2
 
@@ -302,8 +316,8 @@ def biopython_aligner(mode: str, scoring: dict):
     """
     aligner = Align.PairwiseAligner(mode=mode)
     aligner.substitution_matrix = substitution_matrices.load("BLOSUM62") * BLOSUM_SCALE
-    aligner.open_gap_score = scoring["gap_opening"]
-    aligner.extend_gap_score = scoring["gap_extension"]
+    aligner.open_gap_score = scoring["gaps"].open
+    aligner.extend_gap_score = scoring["gaps"].extend
     return aligner
 
 
@@ -325,7 +339,7 @@ def test_against_biopython(backend, mode: str, pair: tuple):
     Scaled to match, this is an equality rather than an inequality, so a change that inflates our
     scores now fails here instead of passing silently.
     """
-    gaps = {"gap_opening": -20, "gap_extension": -1}
+    gaps = {"gaps": AffineGapCosts(open=-20, extend=-1)}
     first, second = pair
     expected = biopython_aligner(mode, gaps).score(first, second)
     assert scorer_for(mode)(first, second, **gaps, **backend) == expected
@@ -335,7 +349,7 @@ def test_against_biopython(backend, mode: str, pair: tuple):
 @pytest.mark.parametrize("mode", MODES)
 def test_against_biopython_fuzzy(backend, mode: str):
     """The same equality on random proteins rather than curated pairs."""
-    gaps = {"gap_opening": -20, "gap_extension": -1}
+    gaps = {"gaps": AffineGapCosts(open=-20, extend=-1)}
     first, second = random_pair(10, 40)
     expected = biopython_aligner(mode, gaps).score(first, second)
     assert scorer_for(mode)(first, second, **gaps, **backend) == expected
@@ -403,15 +417,20 @@ def test_rejects_what_it_cannot_do():
         needleman_wunsch_gotoh_score("AR", "RA", backend="CPU")
     if affinegaps.available("mojo", "cpu"):
         with pytest.raises(NotImplementedError):
-            needleman_wunsch_gotoh_score("AR", "RA", substitution_alphabet="AR", backend="mojo")
+            needleman_wunsch_gotoh_score(
+                "AR",
+                "RA",
+                substitution=TabulatedSubstitutionCosts("AR", np.zeros((2, 2), dtype=np.int8)),
+                backend="mojo",
+            )
 
 
-def test_passing_the_defaults_is_not_custom_scoring():
-    """Naming the default alphabet for readability must not push a caller off the compiled path."""
-    first, second = random_pair()
-    assert needleman_wunsch_gotoh_score(
-        first, second, substitution_alphabet=default_proteins_alphabet, **SCORING
-    ) == needleman_wunsch_gotoh_score(first, second, **SCORING)
+def test_costs_cannot_express_a_contradiction():
+    """The pairing rules that once needed runtime checks are carried by the types."""
+    with pytest.raises(TypeError):
+        UniformSubstitutionCosts(match=5)  # a uniform cost cannot omit half of itself
+    with pytest.raises(ValueError):
+        AffineGapCosts(open=-1, extend=-20)  # a gap that costs less to open than to extend
 
 
 # endregion Compiled Backends
