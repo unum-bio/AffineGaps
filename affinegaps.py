@@ -115,30 +115,57 @@ default_gap_extension: int = int(-0.2 * 5)
 
 def _reconstruct_alignment(
     changes: np.ndarray,
+    scores: np.ndarray,
+    deletes: np.ndarray,
+    inserts: np.ndarray,
     seq1: np.ndarray,
     seq2: np.ndarray,
+    gap_opening: int,
+    gap_extension: int,
     code_to_char: Callable,
     should_continue: Callable,
+    flush_prefixes: bool = True,
 ) -> tuple[str, str]:
+    """Walks the three layers back, so a gap run is never charged twice.
+
+    Reading only `changes` conflates the best move at a cell with whether a gap run is still open,
+    which can split one run in two and pay a second opening penalty. Consulting `deletes` and
+    `inserts` keeps the walk in the layer it entered until that layer says the run began.
+    """
 
     align1, align2 = "", ""
     i, j = len(seq1), len(seq2)
+    state = MATCH
 
     # Backtrack to recover the alignment
     while should_continue(i, j):
-        if changes[i, j] == DELETE:
+        if state == DELETE:
             align1 += code_to_char(seq1[i - 1])
             align2 += "-"
+            extends = deletes[i - 1, j] + gap_extension > scores[i - 1, j] + gap_opening
             i -= 1
-        elif changes[i, j] == INSERT:
+            state = DELETE if extends else MATCH
+        elif state == INSERT:
             align1 += "-"
             align2 += code_to_char(seq2[j - 1])
+            extends = inserts[i, j - 1] + gap_extension > scores[i, j - 1] + gap_opening
             j -= 1
+            state = INSERT if extends else MATCH
+        elif changes[i, j] == DELETE:
+            state = DELETE
+        elif changes[i, j] == INSERT:
+            state = INSERT
         else:  # MATCH or SUBSTITUTE
             align1 += code_to_char(seq1[i - 1])
             align2 += code_to_char(seq2[j - 1])
             i -= 1
             j -= 1
+
+    # A global path must reach the origin, so whatever is left is genuinely aligned against gaps.
+    # A local path stops wherever the score falls to zero, and everything before that is outside
+    # the alignment entirely.
+    if not flush_prefixes:
+        return align1[::-1], align2[::-1]
 
     # Add remaining characters from `seq1` (with gaps in `seq2`)
     while i > 0:
@@ -271,7 +298,9 @@ def levenshtein_alignment(str1: str, str2: str) -> tuple[str, str, int]:
     seq1 = np.array([ord(c) for c in str1], dtype=np.uint32)
     seq2 = np.array([ord(c) for c in str2], dtype=np.uint32)
     scores, changes = _levenshtein_alignment_kernel(seq1, seq2)
-    align1, align2 = _reconstruct_alignment(changes, seq1, seq2, chr, lambda i, j: i > 0 and j > 0)
+    align1, align2 = _reconstruct_alignment(
+        changes, scores, scores, scores, seq1, seq2, 1, 1, chr, lambda i, j: i > 0 and j > 0
+    )
     return align1, align2, int(scores[-1, -1])
 
 
@@ -282,7 +311,7 @@ def _needleman_wunsch_gotoh_kernel(
     substitution_matrix: np.ndarray,
     gap_opening: int,
     gap_extension: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Aligns two sequences using Gotoh's affine gap penalty extensions for the
     Needleman-Wunsch global alignment algorithm.
@@ -302,9 +331,11 @@ def _needleman_wunsch_gotoh_kernel(
     gap_extension (int): The penalty for extending a gap.
 
     Returns:
-    Tuple[np.ndarray, np.ndarray, np.ndarray]: The matrices for alignment scoring:
-        - scores: The primary scoring matrix.
-        - changes: The matrix for gaps in the first sequence.
+    Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The matrices the traceback needs:
+        - scores: The best score reaching each cell in any state.
+        - changes: The operation that achieved it, one of MATCH, SUBSTITUTE, DELETE or INSERT.
+        - deletes: The best score reaching each cell inside a deletion run.
+        - inserts: The best score reaching each cell inside an insertion run.
 
     Example usage:
     >>> seq1 = np.array([1, 2, 3])  # Example sequence
@@ -312,7 +343,7 @@ def _needleman_wunsch_gotoh_kernel(
     >>> substitution_matrix = np.array([[...], [...], [...]])  # Example substitution matrix
     >>> gap_opening = 5
     >>> gap_extension = 2
-    >>> scores, changes = _needleman_wunsch_gotoh_kernel(seq1, seq2, substitution_matrix, gap_opening, gap_extension)
+    >>> scores, changes, deletes, inserts = _needleman_wunsch_gotoh_kernel(seq1, seq2, matrix, opening, extension)
     >>> print("Optimal alignment score matrix:\n", scores)
 
     Notes:
@@ -392,7 +423,7 @@ def _needleman_wunsch_gotoh_kernel(
             else:
                 changes[i, j] = INSERT
 
-    return scores, changes
+    return scores, changes, deletes, inserts
 
 
 def needleman_wunsch_gotoh_alignment(
@@ -448,7 +479,7 @@ def needleman_wunsch_gotoh_alignment(
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
-    scores, changes = _needleman_wunsch_gotoh_kernel(
+    scores, changes, deletes, inserts = _needleman_wunsch_gotoh_kernel(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
@@ -458,8 +489,13 @@ def needleman_wunsch_gotoh_alignment(
 
     align1, align2 = _reconstruct_alignment(
         changes,
+        scores,
+        deletes,
+        inserts,
         seq1,
         seq2,
+        gap_opening,
+        gap_extension,
         lambda x: substitution_alphabet[x],
         lambda i, j: i > 0 and j > 0,
     )
@@ -616,7 +652,7 @@ def _smith_waterman_gotoh_kernel(
     substitution_matrix: np.ndarray,
     gap_opening: int,
     gap_extension: int,
-) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
     """
     Aligns two sequences using Gotoh's affine gap penalty extensions for the
     Smith-Waterman local alignment algorithm.
@@ -636,9 +672,12 @@ def _smith_waterman_gotoh_kernel(
     gap_extension (int): The penalty for extending a gap.
 
     Returns:
-    Tuple[np.ndarray, np.ndarray, np.ndarray]: The matrices for alignment scoring:
-        - scores: The primary scoring matrix.
-        - changes: The matrix for gaps in the first sequence.
+    Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]: What the traceback needs:
+        - scores: The best score reaching each cell in any state.
+        - changes: The operation that achieved it, one of MATCH, SUBSTITUTE, DELETE or INSERT.
+        - deletes: The best score reaching each cell inside a deletion run.
+        - inserts: The best score reaching each cell inside an insertion run.
+        - max_pos: The first row-major cell attaining the highest score, where traceback starts.
 
     Example usage:
     >>> seq1 = np.array([1, 2, 3])  # Example sequence
@@ -646,7 +685,7 @@ def _smith_waterman_gotoh_kernel(
     >>> substitution_matrix = np.array([[...], [...], [...]])  # Example substitution matrix
     >>> gap_opening = 5
     >>> gap_extension = 2
-    >>> scores, changes, max_pos = _smith_waterman_gotoh_kernel(seq1, seq2, matrix, gap_opening, gap_extension)
+    >>> scores, changes, deletes, inserts, best = _smith_waterman_gotoh_kernel(seq1, seq2, matrix, opening, extension)
     >>> print("Optimal alignment score matrix:\n", scores)
 
     Notes:
@@ -733,7 +772,7 @@ def _smith_waterman_gotoh_kernel(
                 max_score = score
                 max_pos = (i, j)
 
-    return scores, changes, max_pos
+    return scores, changes, deletes, inserts, max_pos
 
 
 def smith_waterman_gotoh_alignment(
@@ -773,7 +812,7 @@ def smith_waterman_gotoh_alignment(
 
     seq1 = _translate_sequence(str1, substitution_alphabet)
     seq2 = _translate_sequence(str2, substitution_alphabet)
-    scores, changes, max_pos = _smith_waterman_gotoh_kernel(
+    scores, changes, deletes, inserts, max_pos = _smith_waterman_gotoh_kernel(
         seq1,
         seq2,
         substitution_matrix=substitution_matrix,
@@ -784,10 +823,16 @@ def smith_waterman_gotoh_alignment(
     prefix1, prefix2 = max_pos
     align1, align2 = _reconstruct_alignment(
         changes[: prefix1 + 1, : prefix2 + 1],
+        scores,
+        deletes,
+        inserts,
         seq1[:prefix1],
         seq2[:prefix2],
+        gap_opening,
+        gap_extension,
         lambda x: substitution_alphabet[x],
         lambda i, j: i > 0 and j > 0 and scores[i, j] > 0,
+        flush_prefixes=False,
     )
     return align1, align2, int(scores[prefix1, prefix2])
 
