@@ -38,12 +38,11 @@ jobs:
           version-file: "VERSION"
           update-version-in: |
             pyproject.toml:^version = "(\d+\.\d+\.\d+)"
-            setup.py:    version="(\d+\.\d+\.\d+)"
+            pixi.toml:^version = "(\d+\.\d+\.\d+)"
             affinegaps.py:^__version__ = "(\d+\.\d+\.\d+)"
           dry-run: "true"
 
-  # Gates the matrix below. A formatting or typing break is the same on every interpreter, so
-  # finding it once on the oldest supported one beats finding it three times in parallel.
+  # Gates the matrix below: a formatting or typing break is the same on every interpreter.
   lint:
     name: Static Analysis
     runs-on: ubuntu-24.04
@@ -67,6 +66,30 @@ jobs:
       - name: Types
         run: mypy
 
+  # A hosted runner has no GPU, so this compiles without executing, on all three Mojo platforms.
+  build_mojo:
+    name: Mojo Compiles (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set Up Pixi
+        uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          pixi-version: latest
+          cache: true
+      - name: Build the Extension
+        run: pixi run build
+      - name: Build the Native Tool
+        run: pixi run build-cli
+      - name: Assert the Module Loads
+        run: pixi run python -c "import sys; sys.path.insert(0, 'build'); import affinegaps_mojo; print(sorted(n for n in dir(affinegaps_mojo) if not n.startswith('_')))"
+
   test:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     needs: lint
@@ -88,6 +111,6 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,jit]"
+          pip install -e . --group test
       - name: Test
         run: pytest test.py -x -q

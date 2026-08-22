@@ -1,0 +1,9 @@
+{
+  "recommendations": [
+    "modular-mojotools.vscode-mojo",
+    "ms-python.python",
+    "ms-python.black-formatter",
+    "charliermarsh.ruff",
+    "tamasfe.even-better-toml"
+  ]
+}
